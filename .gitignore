@@ -1,0 +1,21 @@
+# Project planning notes
+todo.md
+
+# Local editor and operating-system files
+.vscode/
+.DS_Store
+
+# C++ build artifacts
+/server
+*.o
+*.obj
+*.out
+*.dSYM/
+build/
+cmake-build-*/
+
+# Local logs and environment overrides
+*.log
+.env
+.env.*
+!.env.example
