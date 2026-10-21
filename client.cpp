@@ -1,12 +1,13 @@
 // NexusProxy developer client
 // Connects to the edge server's tunnel port. Traffic forwarding is not
-// implemented yet, and the current server closes the connection immediately.
+// implemented yet. The edge keeps this connection open as the tunnel.
 
 #include <arpa/inet.h>  // inet_pton() converts an IP string to binary.
 #include <iostream>     // Prints progress and error messages.
 #include <netinet/in.h> // sockaddr_in describes an IPv4 endpoint.
 #include <sys/socket.h> // socket() and connect().
 #include <unistd.h>     // close() releases a file descriptor.
+#include <string>       // std::stoi() converts a string to an integer.
 
 namespace {
 
@@ -52,7 +53,43 @@ namespace {
 
 } // namespace
 
-int main() {
+// The optional arguments choose the local service that will eventually receive
+// tunneled traffic. For example: ./client 127.0.0.1 9000
+int main(int argc, char*argv[]) {
+    // These defaults point to a service on this computer. They are separate from
+    // kEdgeAddress and kTunnelPort, which identify the remote tunnel server.
+    const char* localAddress = "127.0.0.1";
+    int localPort = 9000;
+
+    // argv[0] is the program name, so at most two user-supplied values are valid.
+    if (argc > 3) {
+        std::cerr << "Usage: ./client [local-address] [local-port]" << std::endl;
+        return 1;
+    }
+
+    // The first optional argument replaces the default local address.
+    if (argc >= 2) {
+        localAddress = argv[1];
+    }
+
+    // The second optional argument arrives as text. std::stoi() converts it to an
+    // integer, and the range check ensures it can be used as a TCP port.
+    if (argc >= 3) {
+        try {
+            localPort = std::stoi(argv[2]);
+            if (localPort < 1 || localPort > 65535) {
+                std::cerr << "Invalid port number: " << argv[2] << std::endl;
+                return 1;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Invalid port number: " << argv[2] << std::endl;
+            return 1;
+        }
+    }
+
+    // This confirms the selected target. Connecting to it is the next step.
+    std::cout << "Local service: " << localAddress << ":" << localPort << std::endl;
+
     // client.cpp and server.cpp are separate programs. This function call only
     // prepares the TCP connection; it does not call code inside server.cpp.
     int tunnelSocket = connectToServer(kEdgeAddress, kTunnelPort);
@@ -61,8 +98,7 @@ int main() {
         return 1;
     }
 
-    // Pause so there is time to inspect both programs. The current server still
-    // closes its accepted side of this connection immediately.
+    // Pause so there is time to inspect both programs while the tunnel is open.
     std::cout << "Successfully connected to the server!" << std::endl;
     std::cin.get();
 
