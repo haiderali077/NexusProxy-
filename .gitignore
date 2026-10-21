@@ -1,21 +1,39 @@
 # Project planning notes
 todo.md
+IMPLEMENTATION_PLAN.md
+TRACKER.md
 
 # Local editor and operating-system files
 .vscode/
+.idea/
+.cache/
 .DS_Store
+*.swp
+*.swo
+*~
 
 # C++ build artifacts
 /server
+/client
 *.o
 *.obj
 *.out
 *.dSYM/
 build/
 cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
 
 # Local logs and environment overrides
 *.log
 .env
 .env.*
 !.env.example
+compile_commands.json
