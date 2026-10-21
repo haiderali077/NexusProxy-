@@ -1,8 +1,8 @@
 // NexusProxy edge server
 //
-// Right now this program listens on ports 7000 and 8000. It keeps one accepted
-// client connection open as the tunnel, but it still closes public connections
-// immediately because traffic forwarding is not implemented yet.
+// Right now this program listens on ports 7000 and 8000. It keeps one developer
+// tunnel open, detects when that client disconnects, and then allows a new client
+// to connect. Public connections are still closed because forwarding comes next.
 
 #include <iostream>
 #include <sys/socket.h> // socket(), setsockopt(), bind(), listen(), and accept().
@@ -88,18 +88,22 @@ int main() {
     // the connection returned by accept().
     int tunnelSocket = -1;
 
-    // Each pollfd says which descriptor to watch and which event matters.
-    // revents is filled in by poll() and tells me what actually happened.
-    struct pollfd fds[2];
+    // The first two entries watch the listening sockets. The third watches the
+    // connected tunnel after accept() creates it.
+    struct pollfd fds[3];
     fds[0].fd = socket7000; // Watch for a developer client trying to connect.
     fds[0].events = POLLIN;
     fds[1].fd = socket8000; // Watch for a public user trying to connect.
     fds[1].events = POLLIN;
+    // poll() ignores negative descriptors, so this entry stays inactive until a
+    // developer client connects.
+    fds[2].fd = -1;
+    fds[2].events = POLLIN; // Watch for data or disconnect on the tunnel.
 
     while (true) {
-        // -1 means wait without a timeout. poll() lets one thread wait on both
-        // listeners instead of getting stuck inside accept() on only one port.
-        int result = poll(fds, 2, -1);
+        // The count is 3 because poll() checks every entry in fds. The final -1
+        // means wait indefinitely until one of those descriptors has an event.
+        int result = poll(fds, 3, -1);
 
         if (result == -1) {
             std::cerr << "Poll failed" << std::endl;
@@ -126,6 +130,9 @@ int main() {
                 // Store the accepted descriptor instead of closing it here. The
                 // server now owns it and keeps it for the future relay step.
                 tunnelSocket = acceptedTunnel;
+                // fds[2] now watches this connected socket. fds[0] must continue
+                // watching socket7000 so future connection attempts are noticed.
+                fds[2].fd = tunnelSocket;
                 std::cout << "Accepted and retained tunnel connection on port 7000"
                           << std::endl;
             }
@@ -147,6 +154,31 @@ int main() {
                 std::cout << "Closed client connection on port 8000" << std::endl;
             }
         }
+
+        // An event on the connected socket can mean data arrived, the client
+        // closed cleanly, or the socket failed. recv() tells these cases apart.
+
+    if (tunnelSocket != -1 &&
+    (fds[2].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+        // The client does not send tunnel data yet, so one byte is enough for
+        // this disconnect check. A positive result consumes that byte. The later
+        // forwarding code will replace this with real buffered data handling.
+        char buffer[1];
+        ssize_t bytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
+
+        // recv() returns 0 after a clean disconnect and -1 after an error. This
+        // version treats every recv error as a disconnect; later it should retry
+        // recoverable errors such as EINTR.
+        if (bytesReceived == 0 || bytesReceived == -1) {
+        close(tunnelSocket);
+
+        // Reset both values so poll() ignores fds[2] and a replacement client is
+        // no longer rejected as if the old tunnel were still connected.
+        tunnelSocket = -1;
+        fds[2].fd = -1;
+        std::cout << "Tunnel disconnected; waiting for a new client" << std::endl;
+}
+    }
     }
 
     // These lines run only after the loop ends because poll() reported an error.
