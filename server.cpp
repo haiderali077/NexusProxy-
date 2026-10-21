@@ -1,8 +1,8 @@
 // NexusProxy edge server
 //
-// Right now this program listens on ports 7000 and 8000. It can accept a
-// connection on either port, but it closes every accepted connection right
-// away. It does not keep a tunnel open or forward traffic yet.
+// Right now this program listens on ports 7000 and 8000. It keeps one accepted
+// client connection open as the tunnel, but it still closes public connections
+// immediately because traffic forwarding is not implemented yet.
 
 #include <iostream>
 #include <sys/socket.h> // socket(), setsockopt(), bind(), listen(), and accept().
@@ -83,12 +83,17 @@ int main() {
         return 1;
     }
 
+    // -1 means no developer client is connected yet. This is separate from
+    // socket7000: socket7000 listens for clients, while tunnelSocket will hold
+    // the connection returned by accept().
+    int tunnelSocket = -1;
+
     // Each pollfd says which descriptor to watch and which event matters.
     // revents is filled in by poll() and tells me what actually happened.
     struct pollfd fds[2];
-    fds[0].fd = socket7000;
+    fds[0].fd = socket7000; // Watch for a developer client trying to connect.
     fds[0].events = POLLIN;
-    fds[1].fd = socket8000;
+    fds[1].fd = socket8000; // Watch for a public user trying to connect.
     fds[1].events = POLLIN;
 
     while (true) {
@@ -107,16 +112,22 @@ int main() {
             std::cout << "Connection waiting on port 7000" << std::endl;
             // accept() receives the listening descriptor and creates a new
             // descriptor for this one connection. socket7000 remains a listener.
-            int clientSocket1 = accept(socket7000, nullptr, nullptr);
+            int acceptedTunnel = accept(socket7000, nullptr, nullptr);
 
-            if (clientSocket1 == -1) {
+            if (acceptedTunnel == -1) {
                 std::cerr << "Failed to accept connection on port 7000" << std::endl;
+            } else if (tunnelSocket != -1) {
+                // This version supports one developer tunnel. Rejecting a second
+                // client avoids silently replacing the connection we already own.
+                std::cout << "A tunnel is already connected; rejecting the new client"
+                          << std::endl;
+                close(acceptedTunnel);
             } else {
-                std::cout << "Accepted connection on port 7000" << std::endl;
-                // The current milestone closes the tunnel candidate immediately.
-                // Later this descriptor must stay open for client.cpp's tunnel.
-                close(clientSocket1);
-                std::cout << "Closed client connection on port 7000" << std::endl;
+                // Store the accepted descriptor instead of closing it here. The
+                // server now owns it and keeps it for the future relay step.
+                tunnelSocket = acceptedTunnel;
+                std::cout << "Accepted and retained tunnel connection on port 7000"
+                          << std::endl;
             }
         }
 
@@ -139,7 +150,12 @@ int main() {
     }
 
     // These lines run only after the loop ends because poll() reported an error.
-    // They release the two listening descriptors owned by main().
+    // Release the connected tunnel first, if one was accepted, followed by the
+    // two listening descriptors owned by main().
+    if (tunnelSocket != -1) {
+        close(tunnelSocket);
+        std::cout << "Closed tunnel connection" << std::endl;
+    }
     close(socket7000);
     std::cout << "Closed listener on port 7000" << std::endl;
     close(socket8000);
