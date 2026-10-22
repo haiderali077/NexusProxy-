@@ -4,7 +4,9 @@
 // public connection arrives, it notifies the developer client through the tunnel.
 // Forwarding the public connection's bytes comes next.
 
+#include <cerrno>  // errno and EINTR identify an interrupted send().
 #include <csignal>
+#include <cstddef> // std::size_t stores buffer lengths and byte counts.
 #include <iostream>
 #include <sys/socket.h> // socket(), setsockopt(), bind(), listen(), and accept().
 #include <netinet/in.h> // sockaddr_in, INADDR_ANY, and htons().
@@ -65,6 +67,37 @@ int createListener(int port) {
     // Returning transfers ownership to main(); this function must not close a
     // successfully created listener.
     return serverSocket;
+}
+
+// send() may write fewer bytes than requested, even when it succeeds. This
+// helper will hide that detail from the notification and relay code.
+bool sendAll(int socketFd, const char* data, std::size_t length) {
+    std::size_t bytesSent = 0;
+
+    while (bytesSent < length) {
+        // Skip the bytes already written and give send() only the remaining
+        // part of the buffer. One successful call may still write only part.
+        ssize_t result = send(socketFd, data + bytesSent, length - bytesSent, 0);
+
+        if (result == -1) {
+            if (errno == EINTR) {
+                // A signal interrupted send() before completion, so try again.
+                continue;
+            }
+
+            return false;
+        }
+
+        // No progress means the complete buffer cannot be delivered.
+        if (result == 0) {
+            return false;
+        }
+
+        bytesSent += static_cast<std::size_t>(result);
+    }
+
+    // Reaching this point means every requested byte was accepted by the socket.
+    return true;
 }
 
 int main() {
@@ -167,11 +200,11 @@ int main() {
                 publicSocket = acceptedPublic;
 
                 // 'O' tells the developer client that a public socket is ready.
+                // sendAll() also stays correct if this message later grows and
+                // one send() writes only part of it.
                 const char signal = 'O';
-                ssize_t bytesSent = send(tunnelSocket, &signal,
-                                         sizeof(signal), 0);
 
-                if (bytesSent != static_cast<ssize_t>(sizeof(signal))) {
+                if (!sendAll(tunnelSocket, &signal, sizeof(signal))) {
                     std::cerr << "Failed to notify developer client" << std::endl;
                     close(publicSocket);
                     publicSocket = -1;
