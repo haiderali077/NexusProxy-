@@ -1,6 +1,6 @@
 // NexusProxy developer client
-// Connects to the edge server's tunnel port. Traffic forwarding is not
-// implemented yet. The edge keeps this connection open as the tunnel.
+// Connects to the edge and a local service, then waits for the edge to announce
+// a public connection. Traffic forwarding is not implemented yet.
 
 #include <arpa/inet.h>  // inet_pton() converts an IP string to binary.
 #include <iostream>     // Prints progress and error messages.
@@ -14,15 +14,15 @@ namespace {
 [[maybe_unused]] constexpr const char* kEdgeAddress = "127.0.0.1";
 [[maybe_unused]] constexpr int kTunnelPort = 7000;
 
-// Returns a connected socket descriptor on success and -1 on failure. Returning
-// the descriptor transfers responsibility for closing it to the caller.
-[[maybe_unused]] int connectToServer(const char* address, int port) {
+// Both the edge and the local application are TCP endpoints, so this helper is
+// shared by both connections. The caller owns a successful returned descriptor.
+[[maybe_unused]] int connectTcp(const char* address, int port) {
     // This creates an IPv4 TCP socket. It is not connected until connect()
     // succeeds below.
 
     const int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (clientSocket == -1) {
-        std::cerr << "Failed to create client socket\n";
+        std::cerr << "Failed to create Tcp socket\n";
         return -1;
     }
 
@@ -43,7 +43,7 @@ namespace {
 
     int result = connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress));
     if (result == -1) {
-        std::cerr << "Failed to connect to server: " << address << ":" << port << std::endl;
+        std::cerr << "Failed to connect to Tcp endpoint: " << address << ":" << port << std::endl;
         close(clientSocket);
         return -1;
     }
@@ -87,22 +87,51 @@ int main(int argc, char*argv[]) {
         }
     }
 
-    // This confirms the selected target. Connecting to it is the next step.
+    // This confirms the selected target before any connection is attempted.
     std::cout << "Local service: " << localAddress << ":" << localPort << std::endl;
 
-    // client.cpp and server.cpp are separate programs. This function call only
-    // prepares the TCP connection; it does not call code inside server.cpp.
-    int tunnelSocket = connectToServer(kEdgeAddress, kTunnelPort);
+    // tunnelSocket is the outbound connection to the NexusProxy edge.
+    int tunnelSocket = connectTcp(kEdgeAddress, kTunnelPort);
     if (tunnelSocket == -1) {
         std::cerr << "Failed to connect to server at " << kEdgeAddress << ":" << kTunnelPort << std::endl;
         return 1;
     }
 
-    // Pause so there is time to inspect both programs while the tunnel is open.
-    std::cout << "Successfully connected to the server!" << std::endl;
-    std::cin.get();
+    // localSocket is a separate connection to the application being exposed.
+    int localSocket = connectTcp(localAddress, localPort);
 
-    // main() owns the descriptor returned above, so it releases it when finished.
+    // The tunnel was opened first, so it must be closed if the local connection
+    // fails. Otherwise the edge would keep a connection this process no longer uses.
+    if (localSocket == -1) {
+        std::cerr << "Failed to connect to local service at " << localAddress << ":" << localPort << std::endl;
+        close(tunnelSocket);
+        return 1;
+    }
+
+    // Both connections now exist, but bytes are not forwarded between them yet.
+    std::cout << "Successfully connected to the local service at " << localAddress << ":" << localPort << std::endl;
+
+    // recv() waits until the edge sends its one-byte notification or disconnects.
+    char signal{};
+    ssize_t bytesReceived = recv(tunnelSocket, &signal, sizeof(signal), 0);
+
+    if (bytesReceived <= 0) {
+        std::cerr << "Failed to receive signal from edge" << std::endl;
+        close(localSocket);
+        close(tunnelSocket);
+        return 1;
+    } else if (signal != 'O') {
+        std::cerr << "Unexpected signal received: " << signal << std::endl;
+        close(localSocket);
+        close(tunnelSocket);
+        return 1;
+    }
+
+    // The control message crossed the tunnel, but request bytes are not forwarded.
+    std::cout << "Public connection is ready" << std::endl;
+
+    // main() owns both descriptors returned by connectTcp() and closes each one.
+    close(localSocket);
     close(tunnelSocket);
     return 0;
 }

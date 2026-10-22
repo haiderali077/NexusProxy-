@@ -1,9 +1,10 @@
 // NexusProxy edge server
 //
-// Right now this program listens on ports 7000 and 8000. It keeps one developer
-// tunnel open, detects when that client disconnects, and then allows a new client
-// to connect. Public connections are still closed because forwarding comes next.
+// This program keeps one developer tunnel and one public connection open. When a
+// public connection arrives, it notifies the developer client through the tunnel.
+// Forwarding the public connection's bytes comes next.
 
+#include <csignal>
 #include <iostream>
 #include <sys/socket.h> // socket(), setsockopt(), bind(), listen(), and accept().
 #include <netinet/in.h> // sockaddr_in, INADDR_ANY, and htons().
@@ -67,6 +68,9 @@ int createListener(int port) {
 }
 
 int main() {
+    // Make a failed send() return -1 instead of terminating the whole process.
+    std::signal(SIGPIPE, SIG_IGN);
+
     // Port 7000 is currently intended for the developer client's tunnel.
     int socket7000 = createListener(7000);
     if (socket7000 == -1) {
@@ -87,6 +91,9 @@ int main() {
     // socket7000: socket7000 listens for clients, while tunnelSocket will hold
     // the connection returned by accept().
     int tunnelSocket = -1;
+
+    // The public descriptor must also survive after the accept block finishes.
+    int publicSocket = -1;
 
     // The first two entries watch the listening sockets. The third watches the
     // connected tunnel after accept() creates it.
@@ -142,43 +149,64 @@ int main() {
         // accepted descriptors belong to separate TCP connections.
         if (fds[1].revents & POLLIN) {
             std::cout << "Connection waiting on port 8000" << std::endl;
-            int clientSocket2 = accept(socket8000, nullptr, nullptr);
+            int acceptedPublic = accept(socket8000, nullptr, nullptr);
 
-            if (clientSocket2 == -1) {
+            if (acceptedPublic == -1) {
                 std::cerr << "Failed to accept connection on port 8000" << std::endl;
+            } else if (tunnelSocket == -1) {
+                // There is nowhere to route public traffic without a tunnel.
+                std::cerr << "No tunnel connected; rejecting public connection on port 8000"
+                          << std::endl;
+                close(acceptedPublic);
+            } else if (publicSocket != -1) {
+                // This milestone supports only one public connection at a time.
+                std::cerr << "A public connection is already retained; rejecting the new client on port 8000"
+                          << std::endl;
+                close(acceptedPublic);
             } else {
-                std::cout << "Accepted connection on port 8000" << std::endl;
-                // Public traffic is not forwarded yet, so this connection is
-                // also closed as soon as it is accepted.
-                close(clientSocket2);
-                std::cout << "Closed client connection on port 8000" << std::endl;
+                publicSocket = acceptedPublic;
+
+                // 'O' tells the developer client that a public socket is ready.
+                const char signal = 'O';
+                ssize_t bytesSent = send(tunnelSocket, &signal,
+                                         sizeof(signal), 0);
+
+                if (bytesSent != static_cast<ssize_t>(sizeof(signal))) {
+                    std::cerr << "Failed to notify developer client" << std::endl;
+                    close(publicSocket);
+                    publicSocket = -1;
+                } else {
+                    std::cout << "Retained public connection and notified developer client"
+                              << std::endl;
+                }
             }
         }
 
         // An event on the connected socket can mean data arrived, the client
         // closed cleanly, or the socket failed. recv() tells these cases apart.
 
-    if (tunnelSocket != -1 &&
-    (fds[2].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-        // The client does not send tunnel data yet, so one byte is enough for
-        // this disconnect check. A positive result consumes that byte. The later
-        // forwarding code will replace this with real buffered data handling.
-        char buffer[1];
-        ssize_t bytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
+        if (tunnelSocket != -1 &&
+            (fds[2].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            // The client does not send tunnel data yet, so this read only checks
+            // whether the connection is still alive.
+            char buffer[1];
+            ssize_t bytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
 
-        // recv() returns 0 after a clean disconnect and -1 after an error. This
-        // version treats every recv error as a disconnect; later it should retry
-        // recoverable errors such as EINTR.
-        if (bytesReceived == 0 || bytesReceived == -1) {
-        close(tunnelSocket);
+            if (bytesReceived == 0 || bytesReceived == -1) {
+                close(tunnelSocket);
+                tunnelSocket = -1;
+                fds[2].fd = -1;
 
-        // Reset both values so poll() ignores fds[2] and a replacement client is
-        // no longer rejected as if the old tunnel were still connected.
-        tunnelSocket = -1;
-        fds[2].fd = -1;
-        std::cout << "Tunnel disconnected; waiting for a new client" << std::endl;
-}
-    }
+                // A public socket cannot be served after its tunnel disappears.
+                if (publicSocket != -1) {
+                    close(publicSocket);
+                    publicSocket = -1;
+                }
+
+                std::cout << "Tunnel disconnected; waiting for a new client"
+                          << std::endl;
+            }
+        }
     }
 
     // These lines run only after the loop ends because poll() reported an error.
@@ -187,6 +215,10 @@ int main() {
     if (tunnelSocket != -1) {
         close(tunnelSocket);
         std::cout << "Closed tunnel connection" << std::endl;
+    }
+    if (publicSocket != -1) {
+        close(publicSocket);
+        std::cout << "Closed public connection" << std::endl;
     }
     close(socket7000);
     std::cout << "Closed listener on port 7000" << std::endl;
