@@ -1,13 +1,17 @@
 // NexusProxy developer client
-// Connects to the edge and a local service, then waits for the edge to announce
-// a public connection. Traffic forwarding is not implemented yet.
+// Connects to the edge and a local service. After the edge announces a public
+// connection, request bytes travel through the tunnel into the local service.
 
 #include <arpa/inet.h>  // inet_pton() converts an IP string to binary.
+#include <cerrno>       // errno and EINTR identify interrupted system calls.
+#include <csignal>      // SIGPIPE handling keeps failed sends recoverable.
+#include <cstddef>      // std::size_t stores buffer lengths and byte counts.
+#include <cstring>      // std::strerror() turns errno into a readable message.
 #include <iostream>     // Prints progress and error messages.
 #include <netinet/in.h> // sockaddr_in describes an IPv4 endpoint.
+#include <string>       // std::stoi() converts a string to an integer.
 #include <sys/socket.h> // socket() and connect().
 #include <unistd.h>     // close() releases a file descriptor.
-#include <string>       // std::stoi() converts a string to an integer.
 
 namespace {
 
@@ -53,9 +57,37 @@ namespace {
 
 } // namespace
 
+bool sendAll(int socketFd, const char* data, std::size_t length) {
+    std::size_t bytesSent = 0;
+
+    while (bytesSent < length) {
+        ssize_t result = send(socketFd, data + bytesSent, length - bytesSent, 0);
+
+        if (result == -1) {
+            if (errno == EINTR) {
+                // A signal interrupted send() before completion, so try again.
+                continue;
+            }
+            return false;
+        }
+        if (result == 0) {
+            // No progress means the complete buffer cannot be delivered.
+            return false;
+        }
+
+        bytesSent += static_cast<std::size_t>(result);
+    }
+
+    return true;
+}
+
 // The optional arguments choose the local service that will eventually receive
 // tunneled traffic. For example: ./client 127.0.0.1 9000
-int main(int argc, char*argv[]) {
+int main(int argc, char* argv[]) {
+    // A closed local service should make send() fail instead of terminating this
+    // process with SIGPIPE, allowing the normal cleanup path to run.
+    std::signal(SIGPIPE, SIG_IGN);
+
     // These defaults point to a service on this computer. They are separate from
     // kEdgeAddress and kTunnelPort, which identify the remote tunnel server.
     const char* localAddress = "127.0.0.1";
@@ -108,15 +140,26 @@ int main(int argc, char*argv[]) {
         return 1;
     }
 
-    // Both connections now exist, but bytes are not forwarded between them yet.
+    // Both sides of the developer client are connected and ready for relay data.
     std::cout << "Successfully connected to the local service at " << localAddress << ":" << localPort << std::endl;
 
     // recv() waits until the edge sends its one-byte notification or disconnects.
     char signal{};
-    ssize_t bytesReceived = recv(tunnelSocket, &signal, sizeof(signal), 0);
+    ssize_t bytesReceived;
 
-    if (bytesReceived <= 0) {
-        std::cerr << "Failed to receive signal from edge" << std::endl;
+    do {
+        bytesReceived = recv(tunnelSocket, &signal, sizeof(signal), 0);
+    } while (bytesReceived == -1 && errno == EINTR);
+
+    if (bytesReceived == 0) {
+        std::cerr << "The edge closed the tunnel before sending a notification"
+                  << std::endl;
+        close(localSocket);
+        close(tunnelSocket);
+        return 1;
+    } else if (bytesReceived == -1) {
+        std::cerr << "Failed to receive signal from edge: "
+                  << std::strerror(errno) << std::endl;
         close(localSocket);
         close(tunnelSocket);
         return 1;
@@ -127,11 +170,42 @@ int main(int argc, char*argv[]) {
         return 1;
     }
 
-    // The control message crossed the tunnel, but request bytes are not forwarded.
     std::cout << "Public connection is ready" << std::endl;
+
+    char buffer[4096];
+    bool relaySucceeded = true;
+
+    while (true) {
+        ssize_t tunnelBytesReceived;
+
+        do {
+            tunnelBytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
+        } while (tunnelBytesReceived == -1 && errno == EINTR);
+
+        if (tunnelBytesReceived > 0) {
+            if (!sendAll(localSocket, buffer, static_cast<std::size_t>(tunnelBytesReceived))) {
+                std::cerr << "Failed to send tunnel data to local service" << std::endl;
+                relaySucceeded = false;
+                break;
+            }
+
+            std::cout << "Sent " << tunnelBytesReceived
+                      << " bytes to local service" << std::endl;
+            continue;
+        }
+
+        if (tunnelBytesReceived == 0) {
+            std::cout << "Tunnel connection closed by edge" << std::endl;
+        } else {
+            std::cerr << "Failed to receive tunnel data: "
+                      << std::strerror(errno) << std::endl;
+            relaySucceeded = false;
+        }
+        break;
+    }
 
     // main() owns both descriptors returned by connectTcp() and closes each one.
     close(localSocket);
     close(tunnelSocket);
-    return 0;
+    return relaySucceeded ? 0 : 1;
 }

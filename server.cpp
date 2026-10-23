@@ -1,17 +1,18 @@
 // NexusProxy edge server
 //
-// This program keeps one developer tunnel and one public connection open. When a
-// public connection arrives, it notifies the developer client through the tunnel.
-// Forwarding the public connection's bytes comes next.
+// This program keeps one developer tunnel and one public connection open. It
+// notifies the developer client, then forwards public bytes through the tunnel.
+// The client still needs to pass those bytes to its local service.
 
 #include <cerrno>  // errno and EINTR identify an interrupted send().
 #include <csignal>
 #include <cstddef> // std::size_t stores buffer lengths and byte counts.
+#include <cstring> // std::strerror() turns errno into a readable message.
 #include <iostream>
 #include <sys/socket.h> // socket(), setsockopt(), bind(), listen(), and accept().
 #include <netinet/in.h> // sockaddr_in, INADDR_ANY, and htons().
 #include <unistd.h>     // close() releases a socket descriptor.
-#include <poll.h>       // poll() watches both listening sockets at the same time.
+#include <poll.h>       // poll() watches several sockets at the same time.
 
 // This builds a passive TCP listening socket for one local port. On success the
 // caller owns the returned descriptor and must eventually close it.
@@ -19,9 +20,9 @@ int createListener(int port) {
     // AF_INET means IPv4 and SOCK_STREAM means TCP. The final 0 asks the OS for
     // the default protocol. socket() creates the endpoint, but it is not bound,
     // listening, or connected yet.
-    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    int tcpListenerSocket = socket(AF_INET, SOCK_STREAM, 0);
 
-    if (serverSocket == -1) {
+    if (tcpListenerSocket == -1) {
         std::cerr << "Failed to create socket" << std::endl;
         return -1;
     }
@@ -30,10 +31,10 @@ int createListener(int port) {
     // local address is still tied to an earlier connection. It does not make it
     // safe for two active servers to own the same address and port.
     int option = 1;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR,
+    if (setsockopt(tcpListenerSocket, SOL_SOCKET, SO_REUSEADDR,
                    &option, sizeof(option)) == -1) {
         std::cerr << "Failed to set socket options" << std::endl;
-        close(serverSocket);
+        close(tcpListenerSocket);
         return -1;
     }
 
@@ -48,25 +49,25 @@ int createListener(int port) {
     // bind() assigns this local address and port to the socket. The cast changes
     // my IPv4-specific address pointer to the general type required by the API;
     // the size tells bind() how much address data it received.
-    if (bind(serverSocket, (struct sockaddr*)&serverAddress,
+    if (bind(tcpListenerSocket, (struct sockaddr*)&serverAddress,
              sizeof(serverAddress)) == -1) {
         std::cerr << "Failed to bind port " << port << std::endl;
-        close(serverSocket);
+        close(tcpListenerSocket);
         return -1;
     }
 
     // listen() changes the bound socket into a passive listener. The value 5 is
     // the requested queue size for connections waiting to be accepted.
-    if (listen(serverSocket, 5) == -1) {
+    if (listen(tcpListenerSocket, 5) == -1) {
         std::cerr << "Failed to listen on port " << port << std::endl;
-        close(serverSocket);
+        close(tcpListenerSocket);
         return -1;
     }
 
     std::cout << "Listening on port " << port << std::endl;
     // Returning transfers ownership to main(); this function must not close a
     // successfully created listener.
-    return serverSocket;
+    return tcpListenerSocket;
 }
 
 // send() may write fewer bytes than requested, even when it succeeds. This
@@ -90,6 +91,7 @@ bool sendAll(int socketFd, const char* data, std::size_t length) {
 
         // No progress means the complete buffer cannot be delivered.
         if (result == 0) {
+            std::cerr << "send() made no progress\n";
             return false;
         }
 
@@ -128,9 +130,9 @@ int main() {
     // The public descriptor must also survive after the accept block finishes.
     int publicSocket = -1;
 
-    // The first two entries watch the listening sockets. The third watches the
-    // connected tunnel after accept() creates it.
-    struct pollfd fds[3];
+    // The first two entries watch the listeners. The other entries become active
+    // after accept() creates the tunnel and public connections.
+    struct pollfd fds[4]{};
     fds[0].fd = socket7000; // Watch for a developer client trying to connect.
     fds[0].events = POLLIN;
     fds[1].fd = socket8000; // Watch for a public user trying to connect.
@@ -139,11 +141,13 @@ int main() {
     // developer client connects.
     fds[2].fd = -1;
     fds[2].events = POLLIN; // Watch for data or disconnect on the tunnel.
+    fds[3].fd = -1;
+    fds[3].events = POLLIN; // Watch for request bytes from the public user.
 
     while (true) {
-        // The count is 3 because poll() checks every entry in fds. The final -1
+        // The count is 4 because poll() checks every entry in fds. The final -1
         // means wait indefinitely until one of those descriptors has an event.
-        int result = poll(fds, 3, -1);
+        int result = poll(fds, 4, -1);
 
         if (result == -1) {
             std::cerr << "Poll failed" << std::endl;
@@ -208,10 +212,61 @@ int main() {
                     std::cerr << "Failed to notify developer client" << std::endl;
                     close(publicSocket);
                     publicSocket = -1;
+                    close(tunnelSocket);
+                    tunnelSocket = -1;
+                    fds[2].fd = -1;
                 } else {
+                    // fds[3] lets later poll() calls report every incoming chunk
+                    // instead of blocking inside this accept branch.
+                    fds[3].fd = publicSocket;
                     std::cout << "Retained public connection and notified developer client"
                               << std::endl;
                 }
+            }
+        }
+
+        if (publicSocket != -1 &&
+            (fds[3].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            char buffer[4096];
+            ssize_t bytesReceived;
+
+            // Retry the same read when a signal interrupts recv().
+            do {
+                bytesReceived = recv(publicSocket, buffer, sizeof(buffer), 0);
+            } while (bytesReceived == -1 && errno == EINTR);
+
+            if (bytesReceived > 0) {
+                if (!sendAll(tunnelSocket, buffer,
+                             static_cast<std::size_t>(bytesReceived))) {
+                    std::cerr << "Failed to send public data through the tunnel"
+                              << std::endl;
+                    close(publicSocket);
+                    publicSocket = -1;
+                    fds[3].fd = -1;
+                    close(tunnelSocket);
+                    tunnelSocket = -1;
+                    fds[2].fd = -1;
+                } else {
+                    std::cout << "Sent " << bytesReceived
+                              << " public bytes through the tunnel" << std::endl;
+                }
+            } else {
+                if (bytesReceived == 0) {
+                    std::cout << "Public connection closed by client" << std::endl;
+                } else {
+                    std::cerr << "Failed to receive public data: "
+                              << std::strerror(errno) << std::endl;
+                }
+
+                close(publicSocket);
+                publicSocket = -1;
+                fds[3].fd = -1;
+
+                // This first relay version uses one tunnel per public connection.
+                // Closing it tells the developer client that this stream ended.
+                close(tunnelSocket);
+                tunnelSocket = -1;
+                fds[2].fd = -1;
             }
         }
 
@@ -234,6 +289,7 @@ int main() {
                 if (publicSocket != -1) {
                     close(publicSocket);
                     publicSocket = -1;
+                    fds[3].fd = -1;
                 }
 
                 std::cout << "Tunnel disconnected; waiting for a new client"
