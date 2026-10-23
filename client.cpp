@@ -1,6 +1,7 @@
 // NexusProxy developer client
 // Connects to the edge and a local service. After the edge announces a public
-// connection, request bytes travel through the tunnel into the local service.
+// connection, it relays request and response bytes between the tunnel and the
+// local service.
 
 #include <arpa/inet.h>  // inet_pton() converts an IP string to binary.
 #include <cerrno>       // errno and EINTR identify interrupted system calls.
@@ -12,6 +13,7 @@
 #include <string>       // std::stoi() converts a string to an integer.
 #include <sys/socket.h> // socket() and connect().
 #include <unistd.h>     // close() releases a file descriptor.
+#include <poll.h>       // poll() watches several sockets at the same time.
 
 namespace {
 
@@ -143,6 +145,8 @@ int main(int argc, char* argv[]) {
     // Both sides of the developer client are connected and ready for relay data.
     std::cout << "Successfully connected to the local service at " << localAddress << ":" << localPort << std::endl;
 
+
+
     // recv() waits until the edge sends its one-byte notification or disconnects.
     char signal{};
     ssize_t bytesReceived;
@@ -172,36 +176,89 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Public connection is ready" << std::endl;
 
+    // Watch both connections so requests and responses can move independently.
+    struct pollfd fds[2]{};
+    fds[0].fd = tunnelSocket;
+    fds[0].events = POLLIN;
+    fds[1].fd = localSocket;
+    fds[1].events = POLLIN;
+
     char buffer[4096];
+    // This stays true for a normal disconnect and becomes false on a relay error.
     bool relaySucceeded = true;
 
     while (true) {
-        ssize_t tunnelBytesReceived;
+        int ready;
 
         do {
-            tunnelBytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
-        } while (tunnelBytesReceived == -1 && errno == EINTR);
+            ready = poll(fds, 2, -1);
+        } while (ready == -1 && errno == EINTR);
 
-        if (tunnelBytesReceived > 0) {
-            if (!sendAll(localSocket, buffer, static_cast<std::size_t>(tunnelBytesReceived))) {
-                std::cerr << "Failed to send tunnel data to local service" << std::endl;
-                relaySucceeded = false;
+        if (ready == -1) {
+            std::cerr << "Failed to poll sockets: " << std::strerror(errno) << std::endl;
+            relaySucceeded = false;
+            break;
+        }
+
+        if (fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+            // These are public request bytes coming from the edge.
+            ssize_t tunnelBytesReceived;
+
+            do {
+                tunnelBytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
+            } while (tunnelBytesReceived == -1 && errno == EINTR);
+
+            if (tunnelBytesReceived > 0) {
+                if (!sendAll(localSocket, buffer,
+                             static_cast<std::size_t>(tunnelBytesReceived))) {
+                    std::cerr << "Failed to send tunnel data to local service" << std::endl;
+                    relaySucceeded = false;
+                    break;
+                }
+
+                std::cout << "Sent " << tunnelBytesReceived
+                          << " bytes to local service" << std::endl;
+            } else {
+                // Zero means the edge closed cleanly; -1 means recv() failed.
+                if (tunnelBytesReceived == 0) {
+                    std::cout << "Tunnel connection closed by edge" << std::endl;
+                } else {
+                    std::cerr << "Failed to receive tunnel data: "
+                              << std::strerror(errno) << std::endl;
+                    relaySucceeded = false;
+                }
                 break;
             }
-
-            std::cout << "Sent " << tunnelBytesReceived
-                      << " bytes to local service" << std::endl;
-            continue;
         }
 
-        if (tunnelBytesReceived == 0) {
-            std::cout << "Tunnel connection closed by edge" << std::endl;
-        } else {
-            std::cerr << "Failed to receive tunnel data: "
-                      << std::strerror(errno) << std::endl;
-            relaySucceeded = false;
+        if (fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+            // These are local response bytes that must go back through the tunnel.
+            ssize_t localBytesReceived;
+
+            do {
+                localBytesReceived = recv(localSocket, buffer, sizeof(buffer), 0);
+            } while (localBytesReceived == -1 && errno == EINTR);
+
+            if (localBytesReceived > 0) {
+                if (!sendAll(tunnelSocket, buffer, static_cast<std::size_t>(localBytesReceived))) {
+                    std::cerr << "Failed to send local data through the tunnel" << std::endl;
+                    relaySucceeded = false;
+                    break;
+                }
+
+                std::cout << "Sent " << localBytesReceived
+                          << " local response bytes through the tunnel" << std::endl;
+            } else {
+                if (localBytesReceived == 0) {
+                    std::cout << "Local connection closed by service" << std::endl;
+                } else {
+                    std::cerr << "Failed to receive local data: "
+                              << std::strerror(errno) << std::endl;
+                    relaySucceeded = false;
+                }
+                break;
+            }
         }
-        break;
     }
 
     // main() owns both descriptors returned by connectTcp() and closes each one.

@@ -1,8 +1,8 @@
 // NexusProxy edge server
 //
 // This program keeps one developer tunnel and one public connection open. It
-// notifies the developer client, then forwards public bytes through the tunnel.
-// The client still needs to pass those bytes to its local service.
+// notifies the developer client, then relays bytes in both directions between
+// the public connection and the developer tunnel.
 
 #include <cerrno>  // errno and EINTR identify an interrupted send().
 #include <csignal>
@@ -270,30 +270,57 @@ int main() {
             }
         }
 
-        // An event on the connected socket can mean data arrived, the client
-        // closed cleanly, or the socket failed. recv() tells these cases apart.
-
+        // Tunnel data here is the local service's response for the public user.
         if (tunnelSocket != -1 &&
             (fds[2].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-            // The client does not send tunnel data yet, so this read only checks
-            // whether the connection is still alive.
-            char buffer[1];
-            ssize_t bytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
+            char buffer[4096];
+            ssize_t bytesReceived;
 
-            if (bytesReceived == 0 || bytesReceived == -1) {
+            do {
+                bytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
+            } while (bytesReceived == -1 && errno == EINTR);
+
+            if (bytesReceived > 0) {
+                // A response has nowhere to go if its public connection is gone.
+                if (publicSocket == -1) {
+                    std::cerr << "Received tunnel data without a public connection"
+                              << std::endl;
+                    close(tunnelSocket);
+                    tunnelSocket = -1;
+                    fds[2].fd = -1;
+                } else if (!sendAll(publicSocket, buffer,
+                                    static_cast<std::size_t>(bytesReceived))) {
+                    std::cerr << "Failed to send tunnel data to public client"
+                              << std::endl;
+                    close(publicSocket);
+                    publicSocket = -1;
+                    fds[3].fd = -1;
+                    close(tunnelSocket);
+                    tunnelSocket = -1;
+                    fds[2].fd = -1;
+                } else {
+                    std::cout << "Sent " << bytesReceived
+                              << " response bytes to public client" << std::endl;
+                }
+            } else {
+                if (bytesReceived == 0) {
+                    std::cout << "Tunnel disconnected; waiting for a new client"
+                              << std::endl;
+                } else {
+                    std::cerr << "Failed to receive tunnel data: "
+                              << std::strerror(errno) << std::endl;
+                }
+
                 close(tunnelSocket);
                 tunnelSocket = -1;
                 fds[2].fd = -1;
 
-                // A public socket cannot be served after its tunnel disappears.
+                // The public connection cannot continue without its tunnel.
                 if (publicSocket != -1) {
                     close(publicSocket);
                     publicSocket = -1;
                     fds[3].fd = -1;
                 }
-
-                std::cout << "Tunnel disconnected; waiting for a new client"
-                          << std::endl;
             }
         }
     }
