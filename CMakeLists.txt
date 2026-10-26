@@ -17,6 +17,7 @@ target_include_directories(nexus_protocol PUBLIC
 add_library(nexus_runtime STATIC
     relay.cpp
     socket_utils.cpp
+    unique_socket.cpp
 )
 target_include_directories(nexus_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
