@@ -6,6 +6,7 @@
 #include "protocol.hpp"
 #include "relay.hpp"
 #include "socket_utils.hpp"
+#include "unique_socket.hpp"
 
 #include <cerrno>
 #include <csignal>
@@ -20,12 +21,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using nexus::net::FlushResult;
 using nexus::net::OutputQueue;
+using nexus::net::UniqueSocket;
 using nexus::net::connectTcp;
 using nexus::net::flushOutput;
 using nexus::net::queueFrame;
@@ -39,7 +42,7 @@ constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
 constexpr std::size_t kTunnelControlReserve = 64 * 1024;
 
 struct LocalStream {
-    int socket{-1};
+    UniqueSocket socket;
     OutputQueue output;
     bool closeAfterFlush{};
 };
@@ -63,16 +66,14 @@ void removeLocalStream(
     if (stream == streams.end()) {
         return;
     }
-    close(stream->second.socket);
     streams.erase(stream);
     std::cout << "Closed local stream " << streamId << std::endl;
 }
 
 void closeAllLocalStreams(
     std::unordered_map<std::uint32_t, LocalStream>& streams) {
-    for (auto& [streamId, stream] : streams) {
-        close(stream.socket);
-        std::cout << "Closed local stream " << streamId << std::endl;
+    for (const auto& entry : streams) {
+        std::cout << "Closed local stream " << entry.first << std::endl;
     }
     streams.clear();
 }
@@ -99,24 +100,24 @@ bool handleTunnelFrames(
                 return false;
             }
 
-            const int localSocket = connectTcp(localAddress, localPort);
-            if (localSocket == -1) {
+            UniqueSocket localSocket{connectTcp(localAddress, localPort)};
+            if (!localSocket) {
                 std::cerr << "Failed to connect stream " << frame.streamId
                           << " to " << localAddress << ':' << localPort << ": "
                           << std::strerror(errno) << std::endl;
                 queueClose(tunnelOutput, frame.streamId);
                 continue;
             }
-            if (!setNonBlocking(localSocket)) {
+            if (!setNonBlocking(localSocket.get())) {
                 std::cerr << "Failed to make local stream non-blocking"
                           << std::endl;
-                close(localSocket);
                 queueClose(tunnelOutput, frame.streamId);
                 continue;
             }
 
-            streams.emplace(frame.streamId,
-                            LocalStream{localSocket, {}, false});
+            streams.emplace(
+                frame.streamId,
+                LocalStream{std::move(localSocket), {}, false});
             std::cout << "Opened local stream " << frame.streamId << std::endl;
             continue;
         }
@@ -186,15 +187,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    int tunnelSocket = connectTcp(kEdgeAddress, kTunnelPort);
-    if (tunnelSocket == -1) {
+    UniqueSocket tunnelSocket{connectTcp(kEdgeAddress, kTunnelPort)};
+    if (!tunnelSocket) {
         std::cerr << "Failed to connect to edge " << kEdgeAddress << ':'
                   << kTunnelPort << ": " << std::strerror(errno) << std::endl;
         return 1;
     }
-    if (!setNonBlocking(tunnelSocket)) {
+    if (!setNonBlocking(tunnelSocket.get())) {
         std::cerr << "Failed to make the tunnel non-blocking" << std::endl;
-        close(tunnelSocket);
         return 1;
     }
 
@@ -213,7 +213,7 @@ int main(int argc, char* argv[]) {
         if (!tunnelOutput.empty()) {
             tunnelEvents |= POLLOUT;
         }
-        pollFds.push_back({tunnelSocket, tunnelEvents, 0});
+        pollFds.push_back({tunnelSocket.get(), tunnelEvents, 0});
 
         std::vector<WatchedStream> watchedStreams;
         watchedStreams.reserve(localStreams.size());
@@ -226,7 +226,7 @@ int main(int argc, char* argv[]) {
                 events |= POLLOUT;
             }
             watchedStreams.push_back({streamId, pollFds.size()});
-            pollFds.push_back({stream.socket, events, 0});
+            pollFds.push_back({stream.socket.get(), events, 0});
         }
 
         int ready;
@@ -242,7 +242,8 @@ int main(int argc, char* argv[]) {
 
         const short tunnelReady = pollFds[0].revents;
         if (tunnelReady & POLLOUT) {
-            if (flushOutput(tunnelSocket, tunnelOutput) != FlushResult::Ready) {
+            if (flushOutput(tunnelSocket.get(), tunnelOutput) !=
+                FlushResult::Ready) {
                 std::cerr << "Failed to flush tunnel output" << std::endl;
                 relaySucceeded = false;
                 break;
@@ -253,7 +254,7 @@ int main(int argc, char* argv[]) {
             std::uint8_t buffer[kReadBufferSize];
             while (true) {
                 const ssize_t received =
-                    recv(tunnelSocket, buffer, sizeof(buffer), 0);
+                    recv(tunnelSocket.get(), buffer, sizeof(buffer), 0);
                 if (received > 0) {
                     tunnelDecoder.append(std::span<const std::uint8_t>(
                         buffer, static_cast<std::size_t>(received)));
@@ -300,7 +301,8 @@ int main(int argc, char* argv[]) {
             const short events = pollFds[watched.pollIndex].revents;
             if (events & POLLOUT) {
                 const FlushResult result =
-                    flushOutput(stream->second.socket, stream->second.output);
+                    flushOutput(stream->second.socket.get(),
+                                stream->second.output);
                 if (result != FlushResult::Ready) {
                     queueClose(tunnelOutput, watched.streamId);
                     removeLocalStream(localStreams, watched.streamId);
@@ -326,7 +328,8 @@ int main(int argc, char* argv[]) {
                         break;
                     }
                     const ssize_t received =
-                        recv(current->second.socket, buffer, sizeof(buffer), 0);
+                        recv(current->second.socket.get(), buffer,
+                             sizeof(buffer), 0);
                     if (received > 0) {
                         const nexus::protocol::Frame dataFrame{
                             nexus::protocol::MessageType::Data,
@@ -373,6 +376,5 @@ int main(int argc, char* argv[]) {
     }
 
     closeAllLocalStreams(localStreams);
-    close(tunnelSocket);
     return relaySucceeded ? 0 : 1;
 }

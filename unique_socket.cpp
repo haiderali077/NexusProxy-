@@ -38,6 +38,9 @@ int UniqueSocket::release() noexcept {
 }
 
 void UniqueSocket::reset(int socketFd) noexcept {
+    if (socketFd_ == socketFd) {
+        return;
+    }
     if (socketFd_ != -1) {
         close(socketFd_);
     }
