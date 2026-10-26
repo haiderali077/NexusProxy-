@@ -4,17 +4,16 @@
 // separate connection to the local service, and stream IDs route DATA frames.
 
 #include "protocol.hpp"
+#include "relay.hpp"
+#include "socket_utils.hpp"
 
-#include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fcntl.h>
 #include <iostream>
 #include <limits>
-#include <netinet/in.h>
 #include <poll.h>
 #include <span>
 #include <string>
@@ -25,6 +24,13 @@
 
 namespace {
 
+using nexus::net::FlushResult;
+using nexus::net::OutputQueue;
+using nexus::net::connectTcp;
+using nexus::net::flushOutput;
+using nexus::net::queueFrame;
+using nexus::net::setNonBlocking;
+
 constexpr const char* kEdgeAddress = "127.0.0.1";
 constexpr int kTunnelPort = 7000;
 constexpr std::size_t kReadBufferSize = 16 * 1024;
@@ -32,101 +38,11 @@ constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
 constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
 constexpr std::size_t kTunnelControlReserve = 64 * 1024;
 
-struct OutputQueue {
-    std::vector<std::uint8_t> bytes;
-    std::size_t offset{};
-
-    bool empty() const {
-        return offset == bytes.size();
-    }
-
-    std::size_t pending() const {
-        return bytes.size() - offset;
-    }
-
-    bool canAppend(std::size_t count, std::size_t limit) const {
-        return count <= limit && pending() <= limit - count;
-    }
-
-    bool append(std::span<const std::uint8_t> data, std::size_t limit) {
-        if (!canAppend(data.size(), limit)) {
-            return false;
-        }
-        if (empty()) {
-            bytes.clear();
-            offset = 0;
-        } else if (bytes.size() + data.size() > limit && offset != 0) {
-            bytes.erase(bytes.begin(), bytes.begin() + offset);
-            offset = 0;
-        }
-        bytes.insert(bytes.end(), data.begin(), data.end());
-        return true;
-    }
-
-    void consume(std::size_t count) {
-        offset += count;
-        if (empty()) {
-            bytes.clear();
-            offset = 0;
-        } else if (offset >= 4096 && offset * 2 >= bytes.size()) {
-            bytes.erase(bytes.begin(), bytes.begin() + offset);
-            offset = 0;
-        }
-    }
-};
-
 struct LocalStream {
     int socket{-1};
     OutputQueue output;
     bool closeAfterFlush{};
 };
-
-enum class FlushResult {
-    Ready,
-    Closed,
-    Error,
-};
-
-bool setNonBlocking(int socketFd) {
-    const int flags = fcntl(socketFd, F_GETFL, 0);
-    return flags != -1 &&
-           fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) != -1;
-}
-
-int connectTcp(const char* address, int port) {
-    const int socketFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socketFd == -1) {
-        std::cerr << "Failed to create TCP socket" << std::endl;
-        return -1;
-    }
-
-    sockaddr_in serverAddress{};
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(port);
-    if (inet_pton(AF_INET, address, &serverAddress.sin_addr) != 1) {
-        std::cerr << "Invalid IPv4 address: " << address << std::endl;
-        close(socketFd);
-        return -1;
-    }
-
-    if (connect(socketFd, reinterpret_cast<sockaddr*>(&serverAddress),
-                sizeof(serverAddress)) == -1) {
-        std::cerr << "Failed to connect to " << address << ':' << port << ": "
-                  << std::strerror(errno) << std::endl;
-        close(socketFd);
-        return -1;
-    }
-    return socketFd;
-}
-
-bool queueFrame(OutputQueue& output, const nexus::protocol::Frame& frame,
-                std::size_t limit) {
-    std::vector<std::uint8_t> encoded;
-    if (!nexus::protocol::encodeFrame(frame, encoded)) {
-        return false;
-    }
-    return output.append(encoded, limit);
-}
 
 bool tunnelCanAcceptData(const OutputQueue& output) {
     constexpr std::size_t required = nexus::protocol::kFrameHeaderSize +
@@ -138,28 +54,6 @@ bool queueClose(OutputQueue& tunnelOutput, std::uint32_t streamId) {
     return queueFrame(tunnelOutput,
                       {nexus::protocol::MessageType::Close, streamId, {}},
                       kMaxTunnelQueueBytes);
-}
-
-FlushResult flushOutput(int socketFd, OutputQueue& output) {
-    while (!output.empty()) {
-        const ssize_t sent = send(
-            socketFd, output.bytes.data() + output.offset, output.pending(), 0);
-        if (sent > 0) {
-            output.consume(static_cast<std::size_t>(sent));
-            continue;
-        }
-        if (sent == 0) {
-            return FlushResult::Closed;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return FlushResult::Ready;
-        }
-        return FlushResult::Error;
-    }
-    return FlushResult::Ready;
 }
 
 void removeLocalStream(
@@ -206,10 +100,17 @@ bool handleTunnelFrames(
             }
 
             const int localSocket = connectTcp(localAddress, localPort);
-            if (localSocket == -1 || !setNonBlocking(localSocket)) {
-                if (localSocket != -1) {
-                    close(localSocket);
-                }
+            if (localSocket == -1) {
+                std::cerr << "Failed to connect stream " << frame.streamId
+                          << " to " << localAddress << ':' << localPort << ": "
+                          << std::strerror(errno) << std::endl;
+                queueClose(tunnelOutput, frame.streamId);
+                continue;
+            }
+            if (!setNonBlocking(localSocket)) {
+                std::cerr << "Failed to make local stream non-blocking"
+                          << std::endl;
+                close(localSocket);
                 queueClose(tunnelOutput, frame.streamId);
                 continue;
             }
@@ -286,10 +187,14 @@ int main(int argc, char* argv[]) {
     }
 
     int tunnelSocket = connectTcp(kEdgeAddress, kTunnelPort);
-    if (tunnelSocket == -1 || !setNonBlocking(tunnelSocket)) {
-        if (tunnelSocket != -1) {
-            close(tunnelSocket);
-        }
+    if (tunnelSocket == -1) {
+        std::cerr << "Failed to connect to edge " << kEdgeAddress << ':'
+                  << kTunnelPort << ": " << std::strerror(errno) << std::endl;
+        return 1;
+    }
+    if (!setNonBlocking(tunnelSocket)) {
+        std::cerr << "Failed to make the tunnel non-blocking" << std::endl;
+        close(tunnelSocket);
         return 1;
     }
 

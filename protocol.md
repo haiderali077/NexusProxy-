@@ -880,8 +880,8 @@ loop and allows several buffered frames to be handled in order.
 
 ## 16. How a caller should use the decoder
 
-The future client and server will follow this pattern after `recv()` returns a
-positive byte count:
+The client and server follow this pattern after `recv()` returns a positive byte
+count:
 
 ```cpp
 decoder.append(std::span<const std::uint8_t>(buffer, bytesReceived));
@@ -904,8 +904,8 @@ while (true) {
 }
 ```
 
-This is example integration code, not code currently present in `client.cpp` or
-`server.cpp`.
+This is shortened example code. The real `client.cpp` and `server.cpp` use the
+same append-and-drain loop with their stream maps and cleanup rules.
 
 The three statuses mean:
 
@@ -957,9 +957,10 @@ If measurement later shows front erasing is expensive, common improvements are:
 
 Do not optimize this before profiling shows it matters.
 
-The decoder also does not yet enforce a maximum total buffered-byte count. The
-frame-length limit prevents one declared payload from exceeding 64 KiB, but
-future non-blocking/backpressure work must also bound queued and buffered bytes.
+The decoder itself does not expose a separate total-buffer setting. The frame
+length limit bounds one declared payload to 64 KiB, while the relay module now
+places explicit limits on queued socket output and pauses producers when the
+shared tunnel queue approaches its limit.
 
 ## 19. How the test program works
 

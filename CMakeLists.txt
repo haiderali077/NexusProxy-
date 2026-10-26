@@ -14,12 +14,21 @@ target_include_directories(nexus_protocol PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+add_library(nexus_runtime STATIC
+    relay.cpp
+    socket_utils.cpp
+)
+target_include_directories(nexus_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(nexus_runtime PUBLIC nexus_protocol)
+
 add_executable(nexus-edge
     server.cpp
 )
-target_link_libraries(nexus-edge PRIVATE nexus_protocol)
+target_link_libraries(nexus-edge PRIVATE nexus_runtime)
 
 add_executable(nexus-client
     client.cpp
 )
-target_link_libraries(nexus-client PRIVATE nexus_protocol)
+target_link_libraries(nexus-client PRIVATE nexus_runtime)

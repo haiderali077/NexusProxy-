@@ -4,16 +4,16 @@
 // connection through it. Protocol stream IDs keep each conversation separate.
 
 #include "protocol.hpp"
+#include "relay.hpp"
+#include "socket_utils.hpp"
 
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fcntl.h>
 #include <iostream>
 #include <limits>
-#include <netinet/in.h>
 #include <poll.h>
 #include <span>
 #include <sys/socket.h>
@@ -24,62 +24,18 @@
 
 namespace {
 
+using nexus::net::FlushResult;
+using nexus::net::OutputQueue;
+using nexus::net::flushOutput;
+using nexus::net::queueFrame;
+using nexus::net::setNonBlocking;
+
 constexpr int kTunnelPort = 7000;
 constexpr int kPublicPort = 8000;
 constexpr std::size_t kReadBufferSize = 16 * 1024;
 constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
 constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
 constexpr std::size_t kTunnelControlReserve = 64 * 1024;
-
-// A non-blocking send may stop halfway through a buffer. offset remembers the
-// first unsent byte so the next POLLOUT event can continue from that position.
-struct OutputQueue {
-    std::vector<std::uint8_t> bytes;
-    std::size_t offset{};
-
-    bool empty() const {
-        return offset == bytes.size();
-    }
-
-    std::size_t pending() const {
-        return bytes.size() - offset;
-    }
-
-    bool canAppend(std::size_t count, std::size_t limit) const {
-        return count <= limit && pending() <= limit - count;
-    }
-
-    bool append(std::span<const std::uint8_t> data, std::size_t limit) {
-        if (!canAppend(data.size(), limit)) {
-            return false;
-        }
-        if (empty()) {
-            bytes.clear();
-            offset = 0;
-        } else if (bytes.size() + data.size() > limit && offset != 0) {
-            bytes.erase(bytes.begin(), bytes.begin() + offset);
-            offset = 0;
-        }
-        bytes.insert(bytes.end(), data.begin(), data.end());
-        return true;
-    }
-
-    void consume(std::size_t count) {
-        offset += count;
-        if (empty()) {
-            bytes.clear();
-            offset = 0;
-        } else if (offset >= 4096 && offset * 2 >= bytes.size()) {
-            bytes.erase(bytes.begin(), bytes.begin() + offset);
-            offset = 0;
-        }
-    }
-
-    void clear() {
-        bytes.clear();
-        offset = 0;
-    }
-};
 
 struct PublicStream {
     int socket{-1};
@@ -89,94 +45,12 @@ struct PublicStream {
     bool closeAfterFlush{};
 };
 
-enum class FlushResult {
-    Ready,
-    Closed,
-    Error,
-};
-
-bool setNonBlocking(int socketFd) {
-    const int flags = fcntl(socketFd, F_GETFL, 0);
-    if (flags == -1 || fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        return false;
-    }
-    return true;
-}
-
-int createListener(int port) {
-    const int listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener == -1) {
-        std::cerr << "Failed to create listener for port " << port << std::endl;
-        return -1;
-    }
-
-    int option = 1;
-    if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &option,
-                   sizeof(option)) == -1) {
-        std::cerr << "Failed to set SO_REUSEADDR on port " << port << std::endl;
-        close(listener);
-        return -1;
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-
-    if (bind(listener, reinterpret_cast<sockaddr*>(&address),
-             sizeof(address)) == -1) {
-        std::cerr << "Failed to bind port " << port << ": "
-                  << std::strerror(errno) << std::endl;
-        close(listener);
-        return -1;
-    }
-    if (listen(listener, SOMAXCONN) == -1 || !setNonBlocking(listener)) {
-        std::cerr << "Failed to prepare listener on port " << port << std::endl;
-        close(listener);
-        return -1;
-    }
-
-    std::cout << "Listening on port " << port << std::endl;
-    return listener;
-}
-
-bool queueFrame(OutputQueue& output, const nexus::protocol::Frame& frame,
-                std::size_t limit) {
-    std::vector<std::uint8_t> encoded;
-    if (!nexus::protocol::encodeFrame(frame, encoded)) {
-        return false;
-    }
-    return output.append(encoded, limit);
-}
-
 // Leave room for one DATA frame plus control frames such as CLOSE. When this is
 // false, poll() temporarily stops requesting reads from public sockets.
 bool tunnelCanAcceptData(const OutputQueue& output) {
     constexpr std::size_t required = nexus::protocol::kFrameHeaderSize +
                                      kReadBufferSize + kTunnelControlReserve;
     return output.canAppend(required, kMaxTunnelQueueBytes);
-}
-
-FlushResult flushOutput(int socketFd, OutputQueue& output) {
-    while (!output.empty()) {
-        const ssize_t sent = send(
-            socketFd, output.bytes.data() + output.offset, output.pending(), 0);
-        if (sent > 0) {
-            output.consume(static_cast<std::size_t>(sent));
-            continue;
-        }
-        if (sent == 0) {
-            return FlushResult::Closed;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return FlushResult::Ready;
-        }
-        return FlushResult::Error;
-    }
-    return FlushResult::Ready;
 }
 
 void removePublicStream(
@@ -291,15 +165,22 @@ struct WatchedStream {
 int main() {
     std::signal(SIGPIPE, SIG_IGN);
 
-    const int tunnelListener = createListener(kTunnelPort);
+    const int tunnelListener = nexus::net::createTcpListener(kTunnelPort);
     if (tunnelListener == -1) {
+        std::cerr << "Failed to listen on tunnel port " << kTunnelPort << ": "
+                  << std::strerror(errno) << std::endl;
         return 1;
     }
-    const int publicListener = createListener(kPublicPort);
+    std::cout << "Listening on port " << kTunnelPort << std::endl;
+
+    const int publicListener = nexus::net::createTcpListener(kPublicPort);
     if (publicListener == -1) {
+        std::cerr << "Failed to listen on public port " << kPublicPort << ": "
+                  << std::strerror(errno) << std::endl;
         close(tunnelListener);
         return 1;
     }
+    std::cout << "Listening on port " << kPublicPort << std::endl;
 
     int tunnelSocket = -1;
     std::uint32_t nextStreamId = 1;
