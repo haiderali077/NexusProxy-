@@ -29,6 +29,7 @@ target_include_directories(nexus_protocol PUBLIC
 target_link_libraries(nexus_protocol PRIVATE nexus_warnings)
 
 add_library(nexus_runtime STATIC
+    config.cpp
     relay.cpp
     socket_utils.cpp
     unique_socket.cpp
@@ -50,6 +51,8 @@ add_executable(nexus-client
 target_link_libraries(nexus-client PRIVATE nexus_runtime nexus_warnings)
 
 if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
     add_executable(protocol_tests
         protocol_tests.cpp
     )
@@ -67,4 +70,13 @@ if(BUILD_TESTING)
         nexus_warnings
     )
     add_test(NAME socket_tests COMMAND socket_tests)
+
+    add_test(
+        NAME integration_single_request
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_single_request PROPERTIES TIMEOUT 20)
 endif()

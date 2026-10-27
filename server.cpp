@@ -4,6 +4,7 @@
 // connection through it. Protocol stream IDs keep each conversation separate.
 
 #include "protocol.hpp"
+#include "config.hpp"
 #include "relay.hpp"
 #include "socket_utils.hpp"
 #include "unique_socket.hpp"
@@ -162,26 +163,42 @@ struct WatchedStream {
 
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
 
+    int tunnelPort = kTunnelPort;
+    int publicPort = kPublicPort;
+    if (argc > 3) {
+        std::cerr << "Usage: ./nexus-edge [tunnel-port] [public-port]"
+                  << std::endl;
+        return 1;
+    }
+    if (argc >= 2 && !nexus::config::parsePort(argv[1], tunnelPort)) {
+        std::cerr << "Invalid tunnel port: " << argv[1] << std::endl;
+        return 1;
+    }
+    if (argc >= 3 && !nexus::config::parsePort(argv[2], publicPort)) {
+        std::cerr << "Invalid public port: " << argv[2] << std::endl;
+        return 1;
+    }
+
     UniqueSocket tunnelListener{
-        nexus::net::createTcpListener(kTunnelPort)};
+        nexus::net::createTcpListener(tunnelPort)};
     if (!tunnelListener) {
-        std::cerr << "Failed to listen on tunnel port " << kTunnelPort << ": "
+        std::cerr << "Failed to listen on tunnel port " << tunnelPort << ": "
                   << std::strerror(errno) << std::endl;
         return 1;
     }
-    std::cout << "Listening on port " << kTunnelPort << std::endl;
+    std::cout << "Listening on port " << tunnelPort << std::endl;
 
     UniqueSocket publicListener{
-        nexus::net::createTcpListener(kPublicPort)};
+        nexus::net::createTcpListener(publicPort)};
     if (!publicListener) {
-        std::cerr << "Failed to listen on public port " << kPublicPort << ": "
+        std::cerr << "Failed to listen on public port " << publicPort << ": "
                   << std::strerror(errno) << std::endl;
         return 1;
     }
-    std::cout << "Listening on port " << kPublicPort << std::endl;
+    std::cout << "Listening on port " << publicPort << std::endl;
 
     UniqueSocket tunnelSocket;
     std::uint32_t nextStreamId = 1;

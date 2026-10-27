@@ -4,6 +4,7 @@
 // separate connection to the local service, and stream IDs route DATA frames.
 
 #include "protocol.hpp"
+#include "config.hpp"
 #include "relay.hpp"
 #include "socket_utils.hpp"
 #include "unique_socket.hpp"
@@ -166,31 +167,38 @@ int main(int argc, char* argv[]) {
 
     const char* localAddress = "127.0.0.1";
     int localPort = 9000;
+    const char* edgeAddress = kEdgeAddress;
+    int tunnelPort = kTunnelPort;
 
-    if (argc > 3) {
-        std::cerr << "Usage: ./client [local-address] [local-port]" << std::endl;
+    if (argc > 5) {
+        std::cerr << "Usage: ./nexus-client [local-address] [local-port] "
+                     "[edge-address] [tunnel-port]"
+                  << std::endl;
         return 1;
     }
     if (argc >= 2) {
         localAddress = argv[1];
     }
     if (argc >= 3) {
-        try {
-            localPort = std::stoi(argv[2]);
-        } catch (const std::exception&) {
-            std::cerr << "Invalid port number: " << argv[2] << std::endl;
-            return 1;
-        }
-        if (localPort < 1 || localPort > 65535) {
+        if (!nexus::config::parsePort(argv[2], localPort)) {
             std::cerr << "Invalid port number: " << argv[2] << std::endl;
             return 1;
         }
     }
+    if (argc >= 4) {
+        edgeAddress = argv[3];
+    }
+    if (argc >= 5) {
+        if (!nexus::config::parsePort(argv[4], tunnelPort)) {
+            std::cerr << "Invalid tunnel port: " << argv[4] << std::endl;
+            return 1;
+        }
+    }
 
-    UniqueSocket tunnelSocket{connectTcp(kEdgeAddress, kTunnelPort)};
+    UniqueSocket tunnelSocket{connectTcp(edgeAddress, tunnelPort)};
     if (!tunnelSocket) {
-        std::cerr << "Failed to connect to edge " << kEdgeAddress << ':'
-                  << kTunnelPort << ": " << std::strerror(errno) << std::endl;
+        std::cerr << "Failed to connect to edge " << edgeAddress << ':'
+                  << tunnelPort << ": " << std::strerror(errno) << std::endl;
         return 1;
     }
     if (!setNonBlocking(tunnelSocket.get())) {
