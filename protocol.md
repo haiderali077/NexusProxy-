@@ -250,7 +250,16 @@ protocol code, and reports failure when the observed result differs from the
 expected result. It does not open a network socket, so failures are isolated
 from the client and server.
 
-Build and run it with:
+Build and run all registered unit tests with:
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+`ctest` runs test executables registered by CMake and reports a nonzero status
+when any test fails. To compile this protocol test directly without CMake:
 
 ```bash
 c++ -std=c++20 -Wall -Wextra -Wpedantic \
