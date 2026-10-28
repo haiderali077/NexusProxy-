@@ -13,3 +13,13 @@ add_library(nexus_protocol STATIC
 target_include_directories(nexus_protocol PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+add_executable(nexus-edge
+    server.cpp
+)
+target_link_libraries(nexus-edge PRIVATE nexus_protocol)
+
+add_executable(nexus-client
+    client.cpp
+)
+target_link_libraries(nexus-client PRIVATE nexus_protocol)
