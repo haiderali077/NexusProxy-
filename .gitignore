@@ -22,6 +22,7 @@ PHASE_*_LEARNING_NOTES.md
 *.out
 *.dSYM/
 build/
+build-*/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt

@@ -1067,7 +1067,15 @@ length in network byte order.
 
 ### Sanitizers
 
-The test suite was also run with AddressSanitizer and UndefinedBehaviorSanitizer:
+Configure a separate sanitized build tree and run every registered test with:
+
+```bash
+cmake -S . -B build-sanitized -DNEXUS_ENABLE_SANITIZERS=ON
+cmake --build build-sanitized
+ctest --test-dir build-sanitized --output-on-failure
+```
+
+The equivalent direct compiler command for the protocol test alone is:
 
 ```bash
 c++ -std=c++20 -Wall -Wextra -Wpedantic \
