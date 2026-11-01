@@ -14,6 +14,7 @@
 #include <netinet/in.h> // sockaddr_in, INADDR_ANY, and htons().
 #include <unistd.h>     // close() releases a socket descriptor.
 #include <poll.h>       // poll() watches several sockets at the same time.
+#include <unordered_map> // Connects each stream ID to its public socket.
 
 // This builds a passive TCP listening socket for one local port. On success the
 // caller owns the returned descriptor and must eventually close it.
@@ -136,6 +137,10 @@ int main() {
     std::uint32_t publicStreamId = 0;
     std::uint32_t nextStreamId = 1;
 
+    // The stream ID is the protocol identity; the descriptor is the operating
+    // system resource used to read and write that public TCP connection.
+    std::unordered_map<std::uint32_t, int> publicStreams;
+
     // The first two entries watch the listeners. The other entries become active
     // after accept() creates the tunnel and public connections.
     struct pollfd fds[4]{};
@@ -215,6 +220,7 @@ int main() {
 
                 std::cout << "Assigned stream " << publicStreamId
                           << " to the public connection" << std::endl;
+                publicStreams.emplace(publicStreamId, publicSocket);
 
                 // 'O' tells the developer client that a public socket is ready.
                 // sendAll() also stays correct if this message later grows and
@@ -224,6 +230,7 @@ int main() {
                 if (!sendAll(tunnelSocket, &signal, sizeof(signal))) {
                     std::cerr << "Failed to notify developer client" << std::endl;
                     close(publicSocket);
+                    publicStreams.erase(publicStreamId);
                     publicSocket = -1;
                     publicStreamId = 0;
                     close(tunnelSocket);
@@ -255,6 +262,7 @@ int main() {
                     std::cerr << "Failed to send public data through the tunnel"
                               << std::endl;
                     close(publicSocket);
+                    publicStreams.erase(publicStreamId);
                     publicSocket = -1;
                     publicStreamId = 0;
                     fds[3].fd = -1;
@@ -274,6 +282,7 @@ int main() {
                 }
 
                 close(publicSocket);
+                publicStreams.erase(publicStreamId);
                 publicSocket = -1;
                 publicStreamId = 0;
                 fds[3].fd = -1;
@@ -309,6 +318,7 @@ int main() {
                     std::cerr << "Failed to send tunnel data to public client"
                               << std::endl;
                     close(publicSocket);
+                    publicStreams.erase(publicStreamId);
                     publicSocket = -1;
                     publicStreamId = 0;
                     fds[3].fd = -1;
@@ -335,6 +345,7 @@ int main() {
                 // The public connection cannot continue without its tunnel.
                 if (publicSocket != -1) {
                     close(publicSocket);
+                    publicStreams.erase(publicStreamId);
                     publicSocket = -1;
                     publicStreamId = 0;
                     fds[3].fd = -1;
