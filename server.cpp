@@ -7,6 +7,7 @@
 #include <cerrno>  // errno and EINTR identify an interrupted send().
 #include <csignal>
 #include <cstddef> // std::size_t stores buffer lengths and byte counts.
+#include <cstdint> // std::uint32_t matches the stream ID stored in a frame.
 #include <cstring> // std::strerror() turns errno into a readable message.
 #include <iostream>
 #include <sys/socket.h> // socket(), setsockopt(), bind(), listen(), and accept().
@@ -130,6 +131,11 @@ int main() {
     // The public descriptor must also survive after the accept block finishes.
     int publicSocket = -1;
 
+    // Stream 0 belongs to tunnel-wide control messages, so public connections
+    // receive IDs beginning at 1. The counter advances after every assignment.
+    std::uint32_t publicStreamId = 0;
+    std::uint32_t nextStreamId = 1;
+
     // The first two entries watch the listeners. The other entries become active
     // after accept() creates the tunnel and public connections.
     struct pollfd fds[4]{};
@@ -202,6 +208,13 @@ int main() {
                 close(acceptedPublic);
             } else {
                 publicSocket = acceptedPublic;
+                publicStreamId = nextStreamId++;
+                if (nextStreamId == 0) {
+                    nextStreamId = 1;
+                }
+
+                std::cout << "Assigned stream " << publicStreamId
+                          << " to the public connection" << std::endl;
 
                 // 'O' tells the developer client that a public socket is ready.
                 // sendAll() also stays correct if this message later grows and
@@ -212,6 +225,7 @@ int main() {
                     std::cerr << "Failed to notify developer client" << std::endl;
                     close(publicSocket);
                     publicSocket = -1;
+                    publicStreamId = 0;
                     close(tunnelSocket);
                     tunnelSocket = -1;
                     fds[2].fd = -1;
@@ -242,6 +256,7 @@ int main() {
                               << std::endl;
                     close(publicSocket);
                     publicSocket = -1;
+                    publicStreamId = 0;
                     fds[3].fd = -1;
                     close(tunnelSocket);
                     tunnelSocket = -1;
@@ -260,6 +275,7 @@ int main() {
 
                 close(publicSocket);
                 publicSocket = -1;
+                publicStreamId = 0;
                 fds[3].fd = -1;
 
                 // This first relay version uses one tunnel per public connection.
@@ -294,6 +310,7 @@ int main() {
                               << std::endl;
                     close(publicSocket);
                     publicSocket = -1;
+                    publicStreamId = 0;
                     fds[3].fd = -1;
                     close(tunnelSocket);
                     tunnelSocket = -1;
@@ -319,6 +336,7 @@ int main() {
                 if (publicSocket != -1) {
                     close(publicSocket);
                     publicSocket = -1;
+                    publicStreamId = 0;
                     fds[3].fd = -1;
                 }
             }
