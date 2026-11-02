@@ -4,6 +4,8 @@
 // notifies the developer client, then relays bytes in both directions between
 // the public connection and the developer tunnel.
 
+#include "protocol.hpp"
+
 #include <cerrno>  // errno and EINTR identify an interrupted send().
 #include <csignal>
 #include <cstddef> // std::size_t stores buffer lengths and byte counts.
@@ -15,6 +17,7 @@
 #include <unistd.h>     // close() releases a socket descriptor.
 #include <poll.h>       // poll() watches several sockets at the same time.
 #include <unordered_map> // Connects each stream ID to its public socket.
+#include <vector>       // Holds an encoded protocol frame before sending it.
 
 // This builds a passive TCP listening socket for one local port. On success the
 // caller owns the returned descriptor and must eventually close it.
@@ -102,6 +105,18 @@ bool sendAll(int socketFd, const char* data, std::size_t length) {
 
     // Reaching this point means every requested byte was accepted by the socket.
     return true;
+}
+
+// Control and data messages use the same frame format, so callers only build a
+// Frame and this helper handles conversion to bytes plus complete delivery.
+bool sendFrame(int socketFd, const nexus::protocol::Frame& frame) {
+    std::vector<std::uint8_t> bytes;
+    if (!nexus::protocol::encodeFrame(frame, bytes)) {
+        return false;
+    }
+
+    return sendAll(socketFd, reinterpret_cast<const char*>(bytes.data()),
+                   bytes.size());
 }
 
 int main() {
@@ -222,12 +237,12 @@ int main() {
                           << " to the public connection" << std::endl;
                 publicStreams.emplace(publicStreamId, publicSocket);
 
-                // 'O' tells the developer client that a public socket is ready.
-                // sendAll() also stays correct if this message later grows and
-                // one send() writes only part of it.
-                const char signal = 'O';
+                // OPEN carries the new stream ID, allowing the client to create
+                // the matching local connection before DATA frames arrive.
+                const nexus::protocol::Frame openFrame{
+                    nexus::protocol::MessageType::Open, publicStreamId, {}};
 
-                if (!sendAll(tunnelSocket, &signal, sizeof(signal))) {
+                if (!sendFrame(tunnelSocket, openFrame)) {
                     std::cerr << "Failed to notify developer client" << std::endl;
                     close(publicSocket);
                     publicStreams.erase(publicStreamId);

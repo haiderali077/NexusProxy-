@@ -3,6 +3,9 @@
 // connection, it relays request and response bytes between the tunnel and the
 // local service.
 
+#include "protocol.hpp"
+
+#include <array>        // std::array stores the fixed-size OPEN frame header.
 #include <arpa/inet.h>  // inet_pton() converts an IP string to binary.
 #include <cerrno>       // errno and EINTR identify interrupted system calls.
 #include <csignal>      // SIGPIPE handling keeps failed sends recoverable.
@@ -14,6 +17,7 @@
 #include <sys/socket.h> // socket() and connect().
 #include <unistd.h>     // close() releases a file descriptor.
 #include <poll.h>       // poll() watches several sockets at the same time.
+#include <unordered_map> // Connects each stream ID to its local socket.
 
 namespace {
 
@@ -83,6 +87,41 @@ bool sendAll(int socketFd, const char* data, std::size_t length) {
     return true;
 }
 
+// OPEN has an empty payload, so its complete wire representation is exactly one
+// fixed-size header. Reading the exact size avoids consuming later relay bytes.
+bool receiveOpenFrame(int tunnelSocket, nexus::protocol::Frame& frame) {
+    std::array<std::uint8_t, nexus::protocol::kFrameHeaderSize> bytes{};
+    std::size_t received = 0;
+
+    while (received < bytes.size()) {
+        const ssize_t result = recv(tunnelSocket, bytes.data() + received,
+                                    bytes.size() - received, 0);
+        if (result == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::cerr << "Failed to receive OPEN frame: "
+                      << std::strerror(errno) << std::endl;
+            return false;
+        }
+        if (result == 0) {
+            std::cerr << "The edge closed the tunnel before sending OPEN"
+                      << std::endl;
+            return false;
+        }
+        received += static_cast<std::size_t>(result);
+    }
+
+    nexus::protocol::FrameDecoder decoder;
+    decoder.append(bytes);
+    if (decoder.nextFrame(frame) != nexus::protocol::DecodeStatus::FrameReady ||
+        frame.type != nexus::protocol::MessageType::Open) {
+        std::cerr << "Expected a valid OPEN frame from the edge" << std::endl;
+        return false;
+    }
+    return true;
+}
+
 // The optional arguments choose the local service that will eventually receive
 // tunneled traffic. For example: ./client 127.0.0.1 9000
 int main(int argc, char* argv[]) {
@@ -147,34 +186,20 @@ int main(int argc, char* argv[]) {
 
 
 
-    // recv() waits until the edge sends its one-byte notification or disconnects.
-    char signal{};
-    ssize_t bytesReceived;
-
-    do {
-        bytesReceived = recv(tunnelSocket, &signal, sizeof(signal), 0);
-    } while (bytesReceived == -1 && errno == EINTR);
-
-    if (bytesReceived == 0) {
-        std::cerr << "The edge closed the tunnel before sending a notification"
-                  << std::endl;
-        close(localSocket);
-        close(tunnelSocket);
-        return 1;
-    } else if (bytesReceived == -1) {
-        std::cerr << "Failed to receive signal from edge: "
-                  << std::strerror(errno) << std::endl;
-        close(localSocket);
-        close(tunnelSocket);
-        return 1;
-    } else if (signal != 'O') {
-        std::cerr << "Unexpected signal received: " << signal << std::endl;
+    nexus::protocol::Frame openFrame;
+    if (!receiveOpenFrame(tunnelSocket, openFrame)) {
         close(localSocket);
         close(tunnelSocket);
         return 1;
     }
 
-    std::cout << "Public connection is ready" << std::endl;
+    // The key is the identity used in tunnel frames; the value is the socket
+    // connected to the local application for that public conversation.
+    std::unordered_map<std::uint32_t, int> localStreams;
+    localStreams.emplace(openFrame.streamId, localSocket);
+
+    std::cout << "Public stream " << openFrame.streamId << " is ready"
+              << std::endl;
 
     // Watch both connections so requests and responses can move independently.
     struct pollfd fds[2]{};
@@ -263,6 +288,7 @@ int main(int argc, char* argv[]) {
 
     // main() owns both descriptors returned by connectTcp() and closes each one.
     close(localSocket);
+    localStreams.erase(openFrame.streamId);
     close(tunnelSocket);
     return relaySucceeded ? 0 : 1;
 }
