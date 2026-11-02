@@ -155,6 +155,7 @@ int main() {
     // The stream ID is the protocol identity; the descriptor is the operating
     // system resource used to read and write that public TCP connection.
     std::unordered_map<std::uint32_t, int> publicStreams;
+    nexus::protocol::FrameDecoder tunnelDecoder;
 
     // The first two entries watch the listeners. The other entries become active
     // after accept() creates the tunnel and public connections.
@@ -272,8 +273,13 @@ int main() {
             } while (bytesReceived == -1 && errno == EINTR);
 
             if (bytesReceived > 0) {
-                if (!sendAll(tunnelSocket, buffer,
-                             static_cast<std::size_t>(bytesReceived))) {
+                const auto* payloadBegin =
+                    reinterpret_cast<const std::uint8_t*>(buffer);
+                const nexus::protocol::Frame dataFrame{
+                    nexus::protocol::MessageType::Data, publicStreamId,
+                    {payloadBegin, payloadBegin + bytesReceived}};
+
+                if (!sendFrame(tunnelSocket, dataFrame)) {
                     std::cerr << "Failed to send public data through the tunnel"
                               << std::endl;
                     close(publicSocket);
@@ -321,28 +327,44 @@ int main() {
             } while (bytesReceived == -1 && errno == EINTR);
 
             if (bytesReceived > 0) {
-                // A response has nowhere to go if its public connection is gone.
-                if (publicSocket == -1) {
-                    std::cerr << "Received tunnel data without a public connection"
-                              << std::endl;
-                    close(tunnelSocket);
-                    tunnelSocket = -1;
-                    fds[2].fd = -1;
-                } else if (!sendAll(publicSocket, buffer,
-                                    static_cast<std::size_t>(bytesReceived))) {
-                    std::cerr << "Failed to send tunnel data to public client"
-                              << std::endl;
-                    close(publicSocket);
-                    publicStreams.erase(publicStreamId);
-                    publicSocket = -1;
-                    publicStreamId = 0;
-                    fds[3].fd = -1;
-                    close(tunnelSocket);
-                    tunnelSocket = -1;
-                    fds[2].fd = -1;
-                } else {
-                    std::cout << "Sent " << bytesReceived
-                              << " response bytes to public client" << std::endl;
+                tunnelDecoder.append(std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(buffer),
+                    static_cast<std::size_t>(bytesReceived)));
+
+                while (true) {
+                    nexus::protocol::Frame frame;
+                    const auto status = tunnelDecoder.nextFrame(frame);
+                    if (status == nexus::protocol::DecodeStatus::NeedMoreData) {
+                        break;
+                    }
+                    if (status == nexus::protocol::DecodeStatus::ProtocolError ||
+                        frame.type != nexus::protocol::MessageType::Data) {
+                        std::cerr << "Received an invalid tunnel frame" << std::endl;
+                        close(tunnelSocket);
+                        tunnelSocket = -1;
+                        fds[2].fd = -1;
+                        break;
+                    }
+
+                    const auto publicStream = publicStreams.find(frame.streamId);
+                    if (publicStream == publicStreams.end()) {
+                        std::cerr << "Received DATA for an unknown stream"
+                                  << std::endl;
+                        continue;
+                    }
+
+                    if (!sendAll(publicStream->second,
+                                 reinterpret_cast<const char*>(frame.payload.data()),
+                                 frame.payload.size())) {
+                        std::cerr << "Failed to send DATA to public client"
+                                  << std::endl;
+                        close(publicStream->second);
+                        publicStreams.erase(publicStream);
+                        publicSocket = -1;
+                        publicStreamId = 0;
+                        fds[3].fd = -1;
+                        break;
+                    }
                 }
             } else {
                 if (bytesReceived == 0) {

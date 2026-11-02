@@ -18,6 +18,7 @@
 #include <unistd.h>     // close() releases a file descriptor.
 #include <poll.h>       // poll() watches several sockets at the same time.
 #include <unordered_map> // Connects each stream ID to its local socket.
+#include <vector>       // Holds encoded frames and owned payload bytes.
 
 namespace {
 
@@ -85,6 +86,16 @@ bool sendAll(int socketFd, const char* data, std::size_t length) {
     }
 
     return true;
+}
+
+bool sendFrame(int socketFd, const nexus::protocol::Frame& frame) {
+    std::vector<std::uint8_t> bytes;
+    if (!nexus::protocol::encodeFrame(frame, bytes)) {
+        return false;
+    }
+
+    return sendAll(socketFd, reinterpret_cast<const char*>(bytes.data()),
+                   bytes.size());
 }
 
 // OPEN has an empty payload, so its complete wire representation is exactly one
@@ -209,6 +220,7 @@ int main(int argc, char* argv[]) {
     fds[1].events = POLLIN;
 
     char buffer[4096];
+    nexus::protocol::FrameDecoder tunnelDecoder;
     // This stays true for a normal disconnect and becomes false on a relay error.
     bool relaySucceeded = true;
 
@@ -234,15 +246,44 @@ int main(int argc, char* argv[]) {
             } while (tunnelBytesReceived == -1 && errno == EINTR);
 
             if (tunnelBytesReceived > 0) {
-                if (!sendAll(localSocket, buffer,
-                             static_cast<std::size_t>(tunnelBytesReceived))) {
-                    std::cerr << "Failed to send tunnel data to local service" << std::endl;
-                    relaySucceeded = false;
-                    break;
+                tunnelDecoder.append(std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(buffer),
+                    static_cast<std::size_t>(tunnelBytesReceived)));
+
+                while (true) {
+                    nexus::protocol::Frame frame;
+                    const auto status = tunnelDecoder.nextFrame(frame);
+                    if (status == nexus::protocol::DecodeStatus::NeedMoreData) {
+                        break;
+                    }
+                    if (status == nexus::protocol::DecodeStatus::ProtocolError ||
+                        frame.type != nexus::protocol::MessageType::Data) {
+                        std::cerr << "Received an invalid tunnel frame" << std::endl;
+                        relaySucceeded = false;
+                        break;
+                    }
+
+                    const auto local = localStreams.find(frame.streamId);
+                    if (local == localStreams.end()) {
+                        std::cerr << "Received DATA for an unknown stream"
+                                  << std::endl;
+                        relaySucceeded = false;
+                        break;
+                    }
+
+                    if (!sendAll(local->second,
+                                 reinterpret_cast<const char*>(frame.payload.data()),
+                                 frame.payload.size())) {
+                        std::cerr << "Failed to send DATA to local service"
+                                  << std::endl;
+                        relaySucceeded = false;
+                        break;
+                    }
                 }
 
-                std::cout << "Sent " << tunnelBytesReceived
-                          << " bytes to local service" << std::endl;
+                if (!relaySucceeded) {
+                    break;
+                }
             } else {
                 // Zero means the edge closed cleanly; -1 means recv() failed.
                 if (tunnelBytesReceived == 0) {
@@ -265,7 +306,13 @@ int main(int argc, char* argv[]) {
             } while (localBytesReceived == -1 && errno == EINTR);
 
             if (localBytesReceived > 0) {
-                if (!sendAll(tunnelSocket, buffer, static_cast<std::size_t>(localBytesReceived))) {
+                const auto* payloadBegin =
+                    reinterpret_cast<const std::uint8_t*>(buffer);
+                const nexus::protocol::Frame dataFrame{
+                    nexus::protocol::MessageType::Data, openFrame.streamId,
+                    {payloadBegin, payloadBegin + localBytesReceived}};
+
+                if (!sendFrame(tunnelSocket, dataFrame)) {
                     std::cerr << "Failed to send local data through the tunnel" << std::endl;
                     relaySucceeded = false;
                     break;
