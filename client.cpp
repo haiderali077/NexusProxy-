@@ -223,6 +223,7 @@ int main(int argc, char* argv[]) {
     nexus::protocol::FrameDecoder tunnelDecoder;
     // This stays true for a normal disconnect and becomes false on a relay error.
     bool relaySucceeded = true;
+    bool closeSent = false;
 
     while (true) {
         int ready;
@@ -256,8 +257,7 @@ int main(int argc, char* argv[]) {
                     if (status == nexus::protocol::DecodeStatus::NeedMoreData) {
                         break;
                     }
-                    if (status == nexus::protocol::DecodeStatus::ProtocolError ||
-                        frame.type != nexus::protocol::MessageType::Data) {
+                    if (status == nexus::protocol::DecodeStatus::ProtocolError) {
                         std::cerr << "Received an invalid tunnel frame" << std::endl;
                         relaySucceeded = false;
                         break;
@@ -265,7 +265,21 @@ int main(int argc, char* argv[]) {
 
                     const auto local = localStreams.find(frame.streamId);
                     if (local == localStreams.end()) {
-                        std::cerr << "Received DATA for an unknown stream"
+                        std::cerr << "Received a frame for an unknown stream"
+                                  << std::endl;
+                        relaySucceeded = false;
+                        break;
+                    }
+
+                    if (frame.type == nexus::protocol::MessageType::Close) {
+                        close(local->second);
+                        localStreams.erase(local);
+                        localSocket = -1;
+                        break;
+                    }
+
+                    if (frame.type != nexus::protocol::MessageType::Data) {
+                        std::cerr << "Received an unexpected tunnel frame"
                                   << std::endl;
                         relaySucceeded = false;
                         break;
@@ -276,12 +290,22 @@ int main(int argc, char* argv[]) {
                                  frame.payload.size())) {
                         std::cerr << "Failed to send DATA to local service"
                                   << std::endl;
+                        const nexus::protocol::Frame closeFrame{
+                            nexus::protocol::MessageType::Close,
+                            frame.streamId, {}};
+                        closeSent = sendFrame(tunnelSocket, closeFrame);
+                        close(local->second);
+                        localStreams.erase(local);
+                        localSocket = -1;
                         relaySucceeded = false;
                         break;
                     }
                 }
 
                 if (!relaySucceeded) {
+                    break;
+                }
+                if (localSocket == -1) {
                     break;
                 }
             } else {
@@ -292,6 +316,18 @@ int main(int argc, char* argv[]) {
                     std::cerr << "Failed to receive tunnel data: "
                               << std::strerror(errno) << std::endl;
                     relaySucceeded = false;
+                }
+
+                if (!closeSent) {
+                    const nexus::protocol::Frame closeFrame{
+                        nexus::protocol::MessageType::Close,
+                        openFrame.streamId, {}};
+                    closeSent = sendFrame(tunnelSocket, closeFrame);
+                    if (!closeSent) {
+                        std::cerr << "Failed to send CLOSE for stream "
+                                  << openFrame.streamId << std::endl;
+                        relaySucceeded = false;
+                    }
                 }
                 break;
             }
@@ -334,7 +370,9 @@ int main(int argc, char* argv[]) {
     }
 
     // main() owns both descriptors returned by connectTcp() and closes each one.
-    close(localSocket);
+    if (localSocket != -1) {
+        close(localSocket);
+    }
     localStreams.erase(openFrame.streamId);
     close(tunnelSocket);
     return relaySucceeded ? 0 : 1;

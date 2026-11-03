@@ -302,17 +302,21 @@ int main() {
                               << std::strerror(errno) << std::endl;
                 }
 
+                const nexus::protocol::Frame closeFrame{
+                    nexus::protocol::MessageType::Close, publicStreamId, {}};
+                if (!sendFrame(tunnelSocket, closeFrame)) {
+                    std::cerr << "Failed to send CLOSE for stream "
+                              << publicStreamId << std::endl;
+                    close(tunnelSocket);
+                    tunnelSocket = -1;
+                    fds[2].fd = -1;
+                }
+
                 close(publicSocket);
                 publicStreams.erase(publicStreamId);
                 publicSocket = -1;
                 publicStreamId = 0;
                 fds[3].fd = -1;
-
-                // This first relay version uses one tunnel per public connection.
-                // Closing it tells the developer client that this stream ended.
-                close(tunnelSocket);
-                tunnelSocket = -1;
-                fds[2].fd = -1;
             }
         }
 
@@ -337,8 +341,7 @@ int main() {
                     if (status == nexus::protocol::DecodeStatus::NeedMoreData) {
                         break;
                     }
-                    if (status == nexus::protocol::DecodeStatus::ProtocolError ||
-                        frame.type != nexus::protocol::MessageType::Data) {
+                    if (status == nexus::protocol::DecodeStatus::ProtocolError) {
                         std::cerr << "Received an invalid tunnel frame" << std::endl;
                         close(tunnelSocket);
                         tunnelSocket = -1;
@@ -348,9 +351,27 @@ int main() {
 
                     const auto publicStream = publicStreams.find(frame.streamId);
                     if (publicStream == publicStreams.end()) {
-                        std::cerr << "Received DATA for an unknown stream"
+                        std::cerr << "Received a frame for an unknown stream"
                                   << std::endl;
                         continue;
+                    }
+
+                    if (frame.type == nexus::protocol::MessageType::Close) {
+                        close(publicStream->second);
+                        publicStreams.erase(publicStream);
+                        publicSocket = -1;
+                        publicStreamId = 0;
+                        fds[3].fd = -1;
+                        continue;
+                    }
+
+                    if (frame.type != nexus::protocol::MessageType::Data) {
+                        std::cerr << "Received an unexpected tunnel frame"
+                                  << std::endl;
+                        close(tunnelSocket);
+                        tunnelSocket = -1;
+                        fds[2].fd = -1;
+                        break;
                     }
 
                     if (!sendAll(publicStream->second,
@@ -358,6 +379,13 @@ int main() {
                                  frame.payload.size())) {
                         std::cerr << "Failed to send DATA to public client"
                                   << std::endl;
+                        const nexus::protocol::Frame closeFrame{
+                            nexus::protocol::MessageType::Close, frame.streamId, {}};
+                        if (!sendFrame(tunnelSocket, closeFrame)) {
+                            close(tunnelSocket);
+                            tunnelSocket = -1;
+                            fds[2].fd = -1;
+                        }
                         close(publicStream->second);
                         publicStreams.erase(publicStream);
                         publicSocket = -1;
