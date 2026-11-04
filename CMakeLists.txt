@@ -123,4 +123,13 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:nexus-client>
     )
     set_tests_properties(integration_concurrent_streams PROPERTIES TIMEOUT 30)
+
+    add_test(
+        NAME integration_disconnect_reconnect
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/reconnect_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_disconnect_reconnect PROPERTIES TIMEOUT 30)
 endif()
