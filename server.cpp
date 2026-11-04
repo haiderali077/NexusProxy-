@@ -4,16 +4,18 @@
 // connection through it. Protocol stream IDs keep each conversation separate.
 
 #include "protocol.hpp"
+#include "config.hpp"
+#include "relay.hpp"
+#include "socket_utils.hpp"
+#include "unique_socket.hpp"
 
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fcntl.h>
 #include <iostream>
 #include <limits>
-#include <netinet/in.h>
 #include <poll.h>
 #include <span>
 #include <sys/socket.h>
@@ -24,6 +26,13 @@
 
 namespace {
 
+using nexus::net::FlushResult;
+using nexus::net::OutputQueue;
+using nexus::net::UniqueSocket;
+using nexus::net::flushOutput;
+using nexus::net::queueFrame;
+using nexus::net::setNonBlocking;
+
 constexpr int kTunnelPort = 7000;
 constexpr int kPublicPort = 8000;
 constexpr std::size_t kReadBufferSize = 16 * 1024;
@@ -31,123 +40,13 @@ constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
 constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
 constexpr std::size_t kTunnelControlReserve = 64 * 1024;
 
-// A non-blocking send may stop halfway through a buffer. offset remembers the
-// first unsent byte so the next POLLOUT event can continue from that position.
-struct OutputQueue {
-    std::vector<std::uint8_t> bytes;
-    std::size_t offset{};
-
-    bool empty() const {
-        return offset == bytes.size();
-    }
-
-    std::size_t pending() const {
-        return bytes.size() - offset;
-    }
-
-    bool canAppend(std::size_t count, std::size_t limit) const {
-        return count <= limit && pending() <= limit - count;
-    }
-
-    bool append(std::span<const std::uint8_t> data, std::size_t limit) {
-        if (!canAppend(data.size(), limit)) {
-            return false;
-        }
-        if (empty()) {
-            bytes.clear();
-            offset = 0;
-        } else if (bytes.size() + data.size() > limit && offset != 0) {
-            bytes.erase(bytes.begin(), bytes.begin() + offset);
-            offset = 0;
-        }
-        bytes.insert(bytes.end(), data.begin(), data.end());
-        return true;
-    }
-
-    void consume(std::size_t count) {
-        offset += count;
-        if (empty()) {
-            bytes.clear();
-            offset = 0;
-        } else if (offset >= 4096 && offset * 2 >= bytes.size()) {
-            bytes.erase(bytes.begin(), bytes.begin() + offset);
-            offset = 0;
-        }
-    }
-
-    void clear() {
-        bytes.clear();
-        offset = 0;
-    }
-};
-
 struct PublicStream {
-    int socket{-1};
+    UniqueSocket socket;
     OutputQueue output;
     // CLOSE may arrive after DATA that is still queued. Delay close() until the
     // final bytes reach the public user.
     bool closeAfterFlush{};
 };
-
-enum class FlushResult {
-    Ready,
-    Closed,
-    Error,
-};
-
-bool setNonBlocking(int socketFd) {
-    const int flags = fcntl(socketFd, F_GETFL, 0);
-    if (flags == -1 || fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        return false;
-    }
-    return true;
-}
-
-int createListener(int port) {
-    const int listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener == -1) {
-        std::cerr << "Failed to create listener for port " << port << std::endl;
-        return -1;
-    }
-
-    int option = 1;
-    if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &option,
-                   sizeof(option)) == -1) {
-        std::cerr << "Failed to set SO_REUSEADDR on port " << port << std::endl;
-        close(listener);
-        return -1;
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-
-    if (bind(listener, reinterpret_cast<sockaddr*>(&address),
-             sizeof(address)) == -1) {
-        std::cerr << "Failed to bind port " << port << ": "
-                  << std::strerror(errno) << std::endl;
-        close(listener);
-        return -1;
-    }
-    if (listen(listener, SOMAXCONN) == -1 || !setNonBlocking(listener)) {
-        std::cerr << "Failed to prepare listener on port " << port << std::endl;
-        close(listener);
-        return -1;
-    }
-
-    std::cout << "Listening on port " << port << std::endl;
-    return listener;
-}
-
-bool queueFrame(OutputQueue& output, const nexus::protocol::Frame& frame,
-                std::size_t limit) {
-    std::vector<std::uint8_t> encoded;
-    if (!nexus::protocol::encodeFrame(frame, encoded)) {
-        return false;
-    }
-    return output.append(encoded, limit);
-}
 
 // Leave room for one DATA frame plus control frames such as CLOSE. When this is
 // false, poll() temporarily stops requesting reads from public sockets.
@@ -157,28 +56,6 @@ bool tunnelCanAcceptData(const OutputQueue& output) {
     return output.canAppend(required, kMaxTunnelQueueBytes);
 }
 
-FlushResult flushOutput(int socketFd, OutputQueue& output) {
-    while (!output.empty()) {
-        const ssize_t sent = send(
-            socketFd, output.bytes.data() + output.offset, output.pending(), 0);
-        if (sent > 0) {
-            output.consume(static_cast<std::size_t>(sent));
-            continue;
-        }
-        if (sent == 0) {
-            return FlushResult::Closed;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return FlushResult::Ready;
-        }
-        return FlushResult::Error;
-    }
-    return FlushResult::Ready;
-}
-
 void removePublicStream(
     std::unordered_map<std::uint32_t, PublicStream>& streams,
     std::uint32_t streamId) {
@@ -186,16 +63,14 @@ void removePublicStream(
     if (stream == streams.end()) {
         return;
     }
-    close(stream->second.socket);
     streams.erase(stream);
     std::cout << "Closed public stream " << streamId << std::endl;
 }
 
 void closeAllPublicStreams(
     std::unordered_map<std::uint32_t, PublicStream>& streams) {
-    for (auto& [streamId, stream] : streams) {
-        close(stream.socket);
-        std::cout << "Closed public stream " << streamId << std::endl;
+    for (const auto& entry : streams) {
+        std::cout << "Closed public stream " << entry.first << std::endl;
     }
     streams.clear();
 }
@@ -288,20 +163,44 @@ struct WatchedStream {
 
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
 
-    const int tunnelListener = createListener(kTunnelPort);
-    if (tunnelListener == -1) {
+    int tunnelPort = kTunnelPort;
+    int publicPort = kPublicPort;
+    if (argc > 3) {
+        std::cerr << "Usage: ./nexus-edge [tunnel-port] [public-port]"
+                  << std::endl;
         return 1;
     }
-    const int publicListener = createListener(kPublicPort);
-    if (publicListener == -1) {
-        close(tunnelListener);
+    if (argc >= 2 && !nexus::config::parsePort(argv[1], tunnelPort)) {
+        std::cerr << "Invalid tunnel port: " << argv[1] << std::endl;
+        return 1;
+    }
+    if (argc >= 3 && !nexus::config::parsePort(argv[2], publicPort)) {
+        std::cerr << "Invalid public port: " << argv[2] << std::endl;
         return 1;
     }
 
-    int tunnelSocket = -1;
+    UniqueSocket tunnelListener{
+        nexus::net::createTcpListener(tunnelPort)};
+    if (!tunnelListener) {
+        std::cerr << "Failed to listen on tunnel port " << tunnelPort << ": "
+                  << std::strerror(errno) << std::endl;
+        return 1;
+    }
+    std::cout << "Listening on port " << tunnelPort << std::endl;
+
+    UniqueSocket publicListener{
+        nexus::net::createTcpListener(publicPort)};
+    if (!publicListener) {
+        std::cerr << "Failed to listen on public port " << publicPort << ": "
+                  << std::strerror(errno) << std::endl;
+        return 1;
+    }
+    std::cout << "Listening on port " << publicPort << std::endl;
+
+    UniqueSocket tunnelSocket;
     std::uint32_t nextStreamId = 1;
     std::unordered_map<std::uint32_t, PublicStream> publicStreams;
     nexus::protocol::FrameDecoder tunnelDecoder;
@@ -309,10 +208,7 @@ int main() {
     bool running = true;
 
     auto disconnectTunnel = [&] {
-        if (tunnelSocket != -1) {
-            close(tunnelSocket);
-            tunnelSocket = -1;
-        }
+        tunnelSocket.reset();
         tunnelOutput.clear();
         tunnelDecoder = nexus::protocol::FrameDecoder{};
         closeAllPublicStreams(publicStreams);
@@ -322,19 +218,19 @@ int main() {
 
     while (running) {
         std::vector<pollfd> pollFds;
-        pollFds.push_back({tunnelListener, POLLIN, 0});
+        pollFds.push_back({tunnelListener.get(), POLLIN, 0});
         const short publicListenerEvents =
-            tunnelSocket != -1 && tunnelCanAcceptData(tunnelOutput) ? POLLIN : 0;
-        pollFds.push_back({publicListener, publicListenerEvents, 0});
+            tunnelSocket && tunnelCanAcceptData(tunnelOutput) ? POLLIN : 0;
+        pollFds.push_back({publicListener.get(), publicListenerEvents, 0});
 
         std::size_t tunnelPollIndex = std::numeric_limits<std::size_t>::max();
-        if (tunnelSocket != -1) {
+        if (tunnelSocket) {
             tunnelPollIndex = pollFds.size();
             short events = POLLIN;
             if (!tunnelOutput.empty()) {
                 events |= POLLOUT;
             }
-            pollFds.push_back({tunnelSocket, events, 0});
+            pollFds.push_back({tunnelSocket.get(), events, 0});
         }
 
         std::vector<WatchedStream> watchedStreams;
@@ -348,7 +244,7 @@ int main() {
                 events |= POLLOUT;
             }
             watchedStreams.push_back({streamId, pollFds.size()});
-            pollFds.push_back({stream.socket, events, 0});
+            pollFds.push_back({stream.socket.get(), events, 0});
         }
 
         int ready;
@@ -363,8 +259,9 @@ int main() {
 
         if (pollFds[0].revents & POLLIN) {
             while (true) {
-                const int accepted = accept(tunnelListener, nullptr, nullptr);
-                if (accepted == -1) {
+                UniqueSocket accepted{
+                    accept(tunnelListener.get(), nullptr, nullptr)};
+                if (!accepted) {
                     if (errno == EINTR) {
                         continue;
                     }
@@ -375,15 +272,13 @@ int main() {
                     break;
                 }
 
-                if (tunnelSocket != -1) {
+                if (tunnelSocket) {
                     std::cerr << "A tunnel is already connected; rejecting another"
                               << std::endl;
-                    close(accepted);
-                } else if (!setNonBlocking(accepted)) {
+                } else if (!setNonBlocking(accepted.get())) {
                     std::cerr << "Failed to make tunnel non-blocking" << std::endl;
-                    close(accepted);
                 } else {
-                    tunnelSocket = accepted;
+                    tunnelSocket = std::move(accepted);
                     std::cout << "Developer tunnel connected" << std::endl;
                 }
             }
@@ -391,8 +286,9 @@ int main() {
 
         if (pollFds[1].revents & POLLIN) {
             while (true) {
-                const int accepted = accept(publicListener, nullptr, nullptr);
-                if (accepted == -1) {
+                UniqueSocket accepted{
+                    accept(publicListener.get(), nullptr, nullptr)};
+                if (!accepted) {
                     if (errno == EINTR) {
                         continue;
                     }
@@ -403,16 +299,14 @@ int main() {
                     break;
                 }
 
-                if (tunnelSocket == -1) {
+                if (!tunnelSocket) {
                     std::cerr << "No tunnel connected; rejecting public connection"
                               << std::endl;
-                    close(accepted);
                     continue;
                 }
-                if (!setNonBlocking(accepted)) {
+                if (!setNonBlocking(accepted.get())) {
                     std::cerr << "Failed to make public socket non-blocking"
                               << std::endl;
-                    close(accepted);
                     continue;
                 }
 
@@ -420,11 +314,12 @@ int main() {
                     allocateStreamId(nextStreamId, publicStreams);
                 if (streamId == 0) {
                     std::cerr << "No stream IDs are available" << std::endl;
-                    close(accepted);
                     continue;
                 }
 
-                publicStreams.emplace(streamId, PublicStream{accepted, {}, false});
+                publicStreams.emplace(
+                    streamId,
+                    PublicStream{std::move(accepted), {}, false});
                 if (!queueFrame(tunnelOutput,
                                 {nexus::protocol::MessageType::Open,
                                  streamId, {}},
@@ -436,21 +331,22 @@ int main() {
             }
         }
 
-        if (tunnelSocket != -1 &&
+        if (tunnelSocket &&
             tunnelPollIndex != std::numeric_limits<std::size_t>::max()) {
             const short events = pollFds[tunnelPollIndex].revents;
 
             if (events & POLLOUT) {
-                if (flushOutput(tunnelSocket, tunnelOutput) != FlushResult::Ready) {
+                if (flushOutput(tunnelSocket.get(), tunnelOutput) !=
+                    FlushResult::Ready) {
                     disconnectTunnel();
                 }
             }
 
-            if (tunnelSocket != -1 && (events & (POLLIN | POLLHUP))) {
+            if (tunnelSocket && (events & (POLLIN | POLLHUP))) {
                 std::uint8_t buffer[kReadBufferSize];
                 while (true) {
                     const ssize_t received =
-                        recv(tunnelSocket, buffer, sizeof(buffer), 0);
+                        recv(tunnelSocket.get(), buffer, sizeof(buffer), 0);
                     if (received > 0) {
                         tunnelDecoder.append(std::span<const std::uint8_t>(
                             buffer, static_cast<std::size_t>(received)));
@@ -478,7 +374,7 @@ int main() {
                 }
             }
 
-            if (tunnelSocket != -1 && (events & (POLLERR | POLLNVAL))) {
+            if (tunnelSocket && (events & (POLLERR | POLLNVAL))) {
                 disconnectTunnel();
             }
         }
@@ -492,10 +388,12 @@ int main() {
             const short events = pollFds[watched.pollIndex].revents;
             if (events & POLLOUT) {
                 const FlushResult result =
-                    flushOutput(stream->second.socket, stream->second.output);
+                    flushOutput(stream->second.socket.get(),
+                                stream->second.output);
                 if (result != FlushResult::Ready) {
                     finishPublicStream(publicStreams, tunnelOutput,
-                                       watched.streamId, tunnelSocket != -1);
+                                       watched.streamId,
+                                       static_cast<bool>(tunnelSocket));
                     continue;
                 }
                 if (stream->second.closeAfterFlush &&
@@ -518,7 +416,8 @@ int main() {
                         break;
                     }
                     const ssize_t received =
-                        recv(current->second.socket, buffer, sizeof(buffer), 0);
+                        recv(current->second.socket.get(), buffer,
+                             sizeof(buffer), 0);
                     if (received > 0) {
                         const nexus::protocol::Frame dataFrame{
                             nexus::protocol::MessageType::Data,
@@ -536,7 +435,7 @@ int main() {
                     if (received == 0) {
                         finishPublicStream(publicStreams, tunnelOutput,
                                            watched.streamId,
-                                           tunnelSocket != -1);
+                                           static_cast<bool>(tunnelSocket));
                         streamFinished = true;
                         continue;
                     }
@@ -551,7 +450,8 @@ int main() {
                               << watched.streamId << ": "
                               << std::strerror(errno) << std::endl;
                     finishPublicStream(publicStreams, tunnelOutput,
-                                       watched.streamId, tunnelSocket != -1);
+                                       watched.streamId,
+                                       static_cast<bool>(tunnelSocket));
                     streamFinished = true;
                 }
             }
@@ -559,16 +459,12 @@ int main() {
             if (publicStreams.contains(watched.streamId) &&
                 (events & (POLLERR | POLLNVAL))) {
                 finishPublicStream(publicStreams, tunnelOutput,
-                                   watched.streamId, tunnelSocket != -1);
+                                   watched.streamId,
+                                   static_cast<bool>(tunnelSocket));
             }
         }
     }
 
-    if (tunnelSocket != -1) {
-        close(tunnelSocket);
-    }
     closeAllPublicStreams(publicStreams);
-    close(tunnelListener);
-    close(publicListener);
     return running ? 0 : 1;
 }
