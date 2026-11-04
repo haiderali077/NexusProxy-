@@ -106,6 +106,16 @@ if(BUILD_TESTING)
     )
     add_test(NAME socket_tests COMMAND socket_tests)
 
+    add_executable(relay_tests
+        relay_tests.cpp
+    )
+    target_link_libraries(relay_tests PRIVATE
+        nexus_runtime
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(NAME relay_tests COMMAND relay_tests)
+
     add_test(
         NAME integration_single_request
         COMMAND ${Python3_EXECUTABLE}
@@ -132,4 +142,13 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:nexus-client>
     )
     set_tests_properties(integration_disconnect_reconnect PROPERTIES TIMEOUT 30)
+
+    add_test(
+        NAME integration_protocol_and_limits
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/protection_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_protocol_and_limits PROPERTIES TIMEOUT 30)
 endif()
