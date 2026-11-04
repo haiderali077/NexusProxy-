@@ -1,268 +1,473 @@
 // NexusProxy developer client
-// Connects to the edge and a local service. After the edge announces a public
-// connection, it relays request and response bytes between the tunnel and the
-// local service.
+//
+// One persistent connection reaches the public edge. Each OPEN frame creates a
+// separate connection to the local service, and stream IDs route DATA frames.
 
-#include <arpa/inet.h>  // inet_pton() converts an IP string to binary.
-#include <cerrno>       // errno and EINTR identify interrupted system calls.
-#include <csignal>      // SIGPIPE handling keeps failed sends recoverable.
-#include <cstddef>      // std::size_t stores buffer lengths and byte counts.
-#include <cstring>      // std::strerror() turns errno into a readable message.
-#include <iostream>     // Prints progress and error messages.
-#include <netinet/in.h> // sockaddr_in describes an IPv4 endpoint.
-#include <string>       // std::stoi() converts a string to an integer.
-#include <sys/socket.h> // socket() and connect().
-#include <unistd.h>     // close() releases a file descriptor.
-#include <poll.h>       // poll() watches several sockets at the same time.
+#include "protocol.hpp"
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <iostream>
+#include <limits>
+#include <netinet/in.h>
+#include <poll.h>
+#include <span>
+#include <string>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
-[[maybe_unused]] constexpr const char* kEdgeAddress = "127.0.0.1";
-[[maybe_unused]] constexpr int kTunnelPort = 7000;
+constexpr const char* kEdgeAddress = "127.0.0.1";
+constexpr int kTunnelPort = 7000;
+constexpr std::size_t kReadBufferSize = 16 * 1024;
+constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
+constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
+constexpr std::size_t kTunnelControlReserve = 64 * 1024;
 
-// Both the edge and the local application are TCP endpoints, so this helper is
-// shared by both connections. The caller owns a successful returned descriptor.
-[[maybe_unused]] int connectTcp(const char* address, int port) {
-    // This creates an IPv4 TCP socket. It is not connected until connect()
-    // succeeds below.
+struct OutputQueue {
+    std::vector<std::uint8_t> bytes;
+    std::size_t offset{};
 
-    const int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (clientSocket == -1) {
-        std::cerr << "Failed to create Tcp socket\n";
+    bool empty() const {
+        return offset == bytes.size();
+    }
+
+    std::size_t pending() const {
+        return bytes.size() - offset;
+    }
+
+    bool canAppend(std::size_t count, std::size_t limit) const {
+        return count <= limit && pending() <= limit - count;
+    }
+
+    bool append(std::span<const std::uint8_t> data, std::size_t limit) {
+        if (!canAppend(data.size(), limit)) {
+            return false;
+        }
+        if (empty()) {
+            bytes.clear();
+            offset = 0;
+        } else if (bytes.size() + data.size() > limit && offset != 0) {
+            bytes.erase(bytes.begin(), bytes.begin() + offset);
+            offset = 0;
+        }
+        bytes.insert(bytes.end(), data.begin(), data.end());
+        return true;
+    }
+
+    void consume(std::size_t count) {
+        offset += count;
+        if (empty()) {
+            bytes.clear();
+            offset = 0;
+        } else if (offset >= 4096 && offset * 2 >= bytes.size()) {
+            bytes.erase(bytes.begin(), bytes.begin() + offset);
+            offset = 0;
+        }
+    }
+};
+
+struct LocalStream {
+    int socket{-1};
+    OutputQueue output;
+    bool closeAfterFlush{};
+};
+
+enum class FlushResult {
+    Ready,
+    Closed,
+    Error,
+};
+
+bool setNonBlocking(int socketFd) {
+    const int flags = fcntl(socketFd, F_GETFL, 0);
+    return flags != -1 &&
+           fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) != -1;
+}
+
+int connectTcp(const char* address, int port) {
+    const int socketFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socketFd == -1) {
+        std::cerr << "Failed to create TCP socket" << std::endl;
         return -1;
     }
 
-    // sockaddr_in stores the server's IPv4 address and port. htons() converts
-    // the port to network byte order, while inet_pton() converts the readable IP
-    // address into the binary form expected by connect().
-
-    struct sockaddr_in serverAddress{};
+    sockaddr_in serverAddress{};
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(port);
-    if (inet_pton(AF_INET, address, &serverAddress.sin_addr) <= 0) {
-        std::cerr << "Invalid address: " << address << std::endl;
-        close(clientSocket);
+    if (inet_pton(AF_INET, address, &serverAddress.sin_addr) != 1) {
+        std::cerr << "Invalid IPv4 address: " << address << std::endl;
+        close(socketFd);
         return -1;
     }
-    // connect() needs the socket, the server address, and the size of that
-    // address. Success establishes TCP but does not exchange application data.
 
-    int result = connect(clientSocket, (struct sockaddr*)&serverAddress, sizeof(serverAddress));
-    if (result == -1) {
-        std::cerr << "Failed to connect to Tcp endpoint: " << address << ":" << port << std::endl;
-        close(clientSocket);
+    if (connect(socketFd, reinterpret_cast<sockaddr*>(&serverAddress),
+                sizeof(serverAddress)) == -1) {
+        std::cerr << "Failed to connect to " << address << ':' << port << ": "
+                  << std::strerror(errno) << std::endl;
+        close(socketFd);
         return -1;
     }
-    // Do not close a successful socket here because main() still needs it.
-    return clientSocket;
+    return socketFd;
 }
+
+bool queueFrame(OutputQueue& output, const nexus::protocol::Frame& frame,
+                std::size_t limit) {
+    std::vector<std::uint8_t> encoded;
+    if (!nexus::protocol::encodeFrame(frame, encoded)) {
+        return false;
+    }
+    return output.append(encoded, limit);
+}
+
+bool tunnelCanAcceptData(const OutputQueue& output) {
+    constexpr std::size_t required = nexus::protocol::kFrameHeaderSize +
+                                     kReadBufferSize + kTunnelControlReserve;
+    return output.canAppend(required, kMaxTunnelQueueBytes);
+}
+
+bool queueClose(OutputQueue& tunnelOutput, std::uint32_t streamId) {
+    return queueFrame(tunnelOutput,
+                      {nexus::protocol::MessageType::Close, streamId, {}},
+                      kMaxTunnelQueueBytes);
+}
+
+FlushResult flushOutput(int socketFd, OutputQueue& output) {
+    while (!output.empty()) {
+        const ssize_t sent = send(
+            socketFd, output.bytes.data() + output.offset, output.pending(), 0);
+        if (sent > 0) {
+            output.consume(static_cast<std::size_t>(sent));
+            continue;
+        }
+        if (sent == 0) {
+            return FlushResult::Closed;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return FlushResult::Ready;
+        }
+        return FlushResult::Error;
+    }
+    return FlushResult::Ready;
+}
+
+void removeLocalStream(
+    std::unordered_map<std::uint32_t, LocalStream>& streams,
+    std::uint32_t streamId) {
+    const auto stream = streams.find(streamId);
+    if (stream == streams.end()) {
+        return;
+    }
+    close(stream->second.socket);
+    streams.erase(stream);
+    std::cout << "Closed local stream " << streamId << std::endl;
+}
+
+void closeAllLocalStreams(
+    std::unordered_map<std::uint32_t, LocalStream>& streams) {
+    for (auto& [streamId, stream] : streams) {
+        close(stream.socket);
+        std::cout << "Closed local stream " << streamId << std::endl;
+    }
+    streams.clear();
+}
+
+bool handleTunnelFrames(
+    nexus::protocol::FrameDecoder& decoder,
+    std::unordered_map<std::uint32_t, LocalStream>& streams,
+    OutputQueue& tunnelOutput, const char* localAddress, int localPort) {
+    while (true) {
+        nexus::protocol::Frame frame;
+        const auto status = decoder.nextFrame(frame);
+        if (status == nexus::protocol::DecodeStatus::NeedMoreData) {
+            return true;
+        }
+        if (status == nexus::protocol::DecodeStatus::ProtocolError) {
+            std::cerr << "Tunnel protocol error: " << decoder.error() << std::endl;
+            return false;
+        }
+
+        if (frame.type == nexus::protocol::MessageType::Open) {
+            if (streams.contains(frame.streamId)) {
+                std::cerr << "Received duplicate OPEN for stream "
+                          << frame.streamId << std::endl;
+                return false;
+            }
+
+            const int localSocket = connectTcp(localAddress, localPort);
+            if (localSocket == -1 || !setNonBlocking(localSocket)) {
+                if (localSocket != -1) {
+                    close(localSocket);
+                }
+                queueClose(tunnelOutput, frame.streamId);
+                continue;
+            }
+
+            streams.emplace(frame.streamId,
+                            LocalStream{localSocket, {}, false});
+            std::cout << "Opened local stream " << frame.streamId << std::endl;
+            continue;
+        }
+
+        const auto stream = streams.find(frame.streamId);
+        if (stream == streams.end()) {
+            if (frame.type == nexus::protocol::MessageType::Data) {
+                queueClose(tunnelOutput, frame.streamId);
+            }
+            continue;
+        }
+
+        if (frame.type == nexus::protocol::MessageType::Data) {
+            if (!stream->second.output.append(frame.payload,
+                                               kMaxStreamQueueBytes)) {
+                std::cerr << "Local stream " << frame.streamId
+                          << " exceeded its output limit" << std::endl;
+                queueClose(tunnelOutput, frame.streamId);
+                removeLocalStream(streams, frame.streamId);
+            }
+            continue;
+        }
+        if (frame.type == nexus::protocol::MessageType::Close) {
+            if (stream->second.output.empty()) {
+                removeLocalStream(streams, frame.streamId);
+            } else {
+                stream->second.closeAfterFlush = true;
+            }
+            continue;
+        }
+
+        std::cerr << "Unexpected frame type from edge" << std::endl;
+        return false;
+    }
+}
+
+struct WatchedStream {
+    std::uint32_t streamId{};
+    std::size_t pollIndex{};
+};
 
 } // namespace
 
-bool sendAll(int socketFd, const char* data, std::size_t length) {
-    std::size_t bytesSent = 0;
-
-    while (bytesSent < length) {
-        ssize_t result = send(socketFd, data + bytesSent, length - bytesSent, 0);
-
-        if (result == -1) {
-            if (errno == EINTR) {
-                // A signal interrupted send() before completion, so try again.
-                continue;
-            }
-            return false;
-        }
-        if (result == 0) {
-            // No progress means the complete buffer cannot be delivered.
-            return false;
-        }
-
-        bytesSent += static_cast<std::size_t>(result);
-    }
-
-    return true;
-}
-
-// The optional arguments choose the local service that will eventually receive
-// tunneled traffic. For example: ./client 127.0.0.1 9000
 int main(int argc, char* argv[]) {
-    // A closed local service should make send() fail instead of terminating this
-    // process with SIGPIPE, allowing the normal cleanup path to run.
     std::signal(SIGPIPE, SIG_IGN);
 
-    // These defaults point to a service on this computer. They are separate from
-    // kEdgeAddress and kTunnelPort, which identify the remote tunnel server.
     const char* localAddress = "127.0.0.1";
     int localPort = 9000;
 
-    // argv[0] is the program name, so at most two user-supplied values are valid.
     if (argc > 3) {
         std::cerr << "Usage: ./client [local-address] [local-port]" << std::endl;
         return 1;
     }
-
-    // The first optional argument replaces the default local address.
     if (argc >= 2) {
         localAddress = argv[1];
     }
-
-    // The second optional argument arrives as text. std::stoi() converts it to an
-    // integer, and the range check ensures it can be used as a TCP port.
     if (argc >= 3) {
         try {
             localPort = std::stoi(argv[2]);
-            if (localPort < 1 || localPort > 65535) {
-                std::cerr << "Invalid port number: " << argv[2] << std::endl;
-                return 1;
-            }
-        } catch (const std::exception& e) {
+        } catch (const std::exception&) {
+            std::cerr << "Invalid port number: " << argv[2] << std::endl;
+            return 1;
+        }
+        if (localPort < 1 || localPort > 65535) {
             std::cerr << "Invalid port number: " << argv[2] << std::endl;
             return 1;
         }
     }
 
-    // This confirms the selected target before any connection is attempted.
-    std::cout << "Local service: " << localAddress << ":" << localPort << std::endl;
-
-    // tunnelSocket is the outbound connection to the NexusProxy edge.
     int tunnelSocket = connectTcp(kEdgeAddress, kTunnelPort);
-    if (tunnelSocket == -1) {
-        std::cerr << "Failed to connect to server at " << kEdgeAddress << ":" << kTunnelPort << std::endl;
+    if (tunnelSocket == -1 || !setNonBlocking(tunnelSocket)) {
+        if (tunnelSocket != -1) {
+            close(tunnelSocket);
+        }
         return 1;
     }
 
-    // localSocket is a separate connection to the application being exposed.
-    int localSocket = connectTcp(localAddress, localPort);
+    std::cout << "Connected to edge; exposing " << localAddress << ':'
+              << localPort << std::endl;
 
-    // The tunnel was opened first, so it must be closed if the local connection
-    // fails. Otherwise the edge would keep a connection this process no longer uses.
-    if (localSocket == -1) {
-        std::cerr << "Failed to connect to local service at " << localAddress << ":" << localPort << std::endl;
-        close(tunnelSocket);
-        return 1;
-    }
-
-    // Both sides of the developer client are connected and ready for relay data.
-    std::cout << "Successfully connected to the local service at " << localAddress << ":" << localPort << std::endl;
-
-
-
-    // recv() waits until the edge sends its one-byte notification or disconnects.
-    char signal{};
-    ssize_t bytesReceived;
-
-    do {
-        bytesReceived = recv(tunnelSocket, &signal, sizeof(signal), 0);
-    } while (bytesReceived == -1 && errno == EINTR);
-
-    if (bytesReceived == 0) {
-        std::cerr << "The edge closed the tunnel before sending a notification"
-                  << std::endl;
-        close(localSocket);
-        close(tunnelSocket);
-        return 1;
-    } else if (bytesReceived == -1) {
-        std::cerr << "Failed to receive signal from edge: "
-                  << std::strerror(errno) << std::endl;
-        close(localSocket);
-        close(tunnelSocket);
-        return 1;
-    } else if (signal != 'O') {
-        std::cerr << "Unexpected signal received: " << signal << std::endl;
-        close(localSocket);
-        close(tunnelSocket);
-        return 1;
-    }
-
-    std::cout << "Public connection is ready" << std::endl;
-
-    // Watch both connections so requests and responses can move independently.
-    struct pollfd fds[2]{};
-    fds[0].fd = tunnelSocket;
-    fds[0].events = POLLIN;
-    fds[1].fd = localSocket;
-    fds[1].events = POLLIN;
-
-    char buffer[4096];
-    // This stays true for a normal disconnect and becomes false on a relay error.
+    std::unordered_map<std::uint32_t, LocalStream> localStreams;
+    nexus::protocol::FrameDecoder tunnelDecoder;
+    OutputQueue tunnelOutput;
     bool relaySucceeded = true;
+    bool running = true;
 
-    while (true) {
+    while (running) {
+        std::vector<pollfd> pollFds;
+        short tunnelEvents = POLLIN;
+        if (!tunnelOutput.empty()) {
+            tunnelEvents |= POLLOUT;
+        }
+        pollFds.push_back({tunnelSocket, tunnelEvents, 0});
+
+        std::vector<WatchedStream> watchedStreams;
+        watchedStreams.reserve(localStreams.size());
+        for (const auto& [streamId, stream] : localStreams) {
+            short events =
+                !stream.closeAfterFlush && tunnelCanAcceptData(tunnelOutput)
+                    ? POLLIN
+                    : 0;
+            if (!stream.output.empty()) {
+                events |= POLLOUT;
+            }
+            watchedStreams.push_back({streamId, pollFds.size()});
+            pollFds.push_back({stream.socket, events, 0});
+        }
+
         int ready;
-
         do {
-            ready = poll(fds, 2, -1);
+            ready = poll(pollFds.data(), pollFds.size(), -1);
         } while (ready == -1 && errno == EINTR);
 
         if (ready == -1) {
-            std::cerr << "Failed to poll sockets: " << std::strerror(errno) << std::endl;
+            std::cerr << "poll() failed: " << std::strerror(errno) << std::endl;
             relaySucceeded = false;
             break;
         }
 
-        if (fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
-            // These are public request bytes coming from the edge.
-            ssize_t tunnelBytesReceived;
-
-            do {
-                tunnelBytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
-            } while (tunnelBytesReceived == -1 && errno == EINTR);
-
-            if (tunnelBytesReceived > 0) {
-                if (!sendAll(localSocket, buffer,
-                             static_cast<std::size_t>(tunnelBytesReceived))) {
-                    std::cerr << "Failed to send tunnel data to local service" << std::endl;
-                    relaySucceeded = false;
-                    break;
-                }
-
-                std::cout << "Sent " << tunnelBytesReceived
-                          << " bytes to local service" << std::endl;
-            } else {
-                // Zero means the edge closed cleanly; -1 means recv() failed.
-                if (tunnelBytesReceived == 0) {
-                    std::cout << "Tunnel connection closed by edge" << std::endl;
-                } else {
-                    std::cerr << "Failed to receive tunnel data: "
-                              << std::strerror(errno) << std::endl;
-                    relaySucceeded = false;
-                }
+        const short tunnelReady = pollFds[0].revents;
+        if (tunnelReady & POLLOUT) {
+            if (flushOutput(tunnelSocket, tunnelOutput) != FlushResult::Ready) {
+                std::cerr << "Failed to flush tunnel output" << std::endl;
+                relaySucceeded = false;
                 break;
             }
         }
 
-        if (fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
-            // These are local response bytes that must go back through the tunnel.
-            ssize_t localBytesReceived;
-
-            do {
-                localBytesReceived = recv(localSocket, buffer, sizeof(buffer), 0);
-            } while (localBytesReceived == -1 && errno == EINTR);
-
-            if (localBytesReceived > 0) {
-                if (!sendAll(tunnelSocket, buffer, static_cast<std::size_t>(localBytesReceived))) {
-                    std::cerr << "Failed to send local data through the tunnel" << std::endl;
-                    relaySucceeded = false;
+        if (tunnelReady & (POLLIN | POLLHUP)) {
+            std::uint8_t buffer[kReadBufferSize];
+            while (true) {
+                const ssize_t received =
+                    recv(tunnelSocket, buffer, sizeof(buffer), 0);
+                if (received > 0) {
+                    tunnelDecoder.append(std::span<const std::uint8_t>(
+                        buffer, static_cast<std::size_t>(received)));
+                    if (!handleTunnelFrames(tunnelDecoder, localStreams,
+                                            tunnelOutput, localAddress,
+                                            localPort)) {
+                        relaySucceeded = false;
+                        running = false;
+                        break;
+                    }
+                    continue;
+                }
+                if (received == 0) {
+                    std::cout << "Edge closed the tunnel" << std::endl;
+                    running = false;
                     break;
                 }
-
-                std::cout << "Sent " << localBytesReceived
-                          << " local response bytes through the tunnel" << std::endl;
-            } else {
-                if (localBytesReceived == 0) {
-                    std::cout << "Local connection closed by service" << std::endl;
-                } else {
-                    std::cerr << "Failed to receive local data: "
-                              << std::strerror(errno) << std::endl;
-                    relaySucceeded = false;
+                if (errno == EINTR) {
+                    continue;
                 }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                std::cerr << "Tunnel recv() failed: " << std::strerror(errno)
+                          << std::endl;
+                relaySucceeded = false;
+                running = false;
                 break;
+            }
+        }
+
+        if (tunnelReady & (POLLERR | POLLNVAL)) {
+            std::cerr << "Tunnel reported a socket error" << std::endl;
+            relaySucceeded = false;
+            break;
+        }
+
+        for (const WatchedStream watched : watchedStreams) {
+            const auto stream = localStreams.find(watched.streamId);
+            if (stream == localStreams.end()) {
+                continue;
+            }
+
+            const short events = pollFds[watched.pollIndex].revents;
+            if (events & POLLOUT) {
+                const FlushResult result =
+                    flushOutput(stream->second.socket, stream->second.output);
+                if (result != FlushResult::Ready) {
+                    queueClose(tunnelOutput, watched.streamId);
+                    removeLocalStream(localStreams, watched.streamId);
+                    continue;
+                }
+                if (stream->second.closeAfterFlush &&
+                    stream->second.output.empty()) {
+                    removeLocalStream(localStreams, watched.streamId);
+                    continue;
+                }
+            }
+
+            const auto current = localStreams.find(watched.streamId);
+            if (current == localStreams.end()) {
+                continue;
+            }
+
+            if (events & (POLLIN | POLLHUP)) {
+                std::uint8_t buffer[kReadBufferSize];
+                bool streamFinished = false;
+                while (!streamFinished) {
+                    if (!tunnelCanAcceptData(tunnelOutput)) {
+                        break;
+                    }
+                    const ssize_t received =
+                        recv(current->second.socket, buffer, sizeof(buffer), 0);
+                    if (received > 0) {
+                        const nexus::protocol::Frame dataFrame{
+                            nexus::protocol::MessageType::Data,
+                            watched.streamId,
+                            {buffer, buffer + received}};
+                        if (!queueFrame(tunnelOutput, dataFrame,
+                                        kMaxTunnelQueueBytes)) {
+                            std::cerr << "Failed to encode DATA for stream "
+                                      << watched.streamId << std::endl;
+                            relaySucceeded = false;
+                            running = false;
+                            streamFinished = true;
+                        }
+                        continue;
+                    }
+                    if (received == 0) {
+                        queueClose(tunnelOutput, watched.streamId);
+                        removeLocalStream(localStreams, watched.streamId);
+                        streamFinished = true;
+                        continue;
+                    }
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        streamFinished = true;
+                        continue;
+                    }
+                    std::cerr << "Local recv() failed for stream "
+                              << watched.streamId << ": "
+                              << std::strerror(errno) << std::endl;
+                    queueClose(tunnelOutput, watched.streamId);
+                    removeLocalStream(localStreams, watched.streamId);
+                    streamFinished = true;
+                }
+            }
+
+            if (localStreams.contains(watched.streamId) &&
+                (events & (POLLERR | POLLNVAL))) {
+                queueClose(tunnelOutput, watched.streamId);
+                removeLocalStream(localStreams, watched.streamId);
             }
         }
     }
 
-    // main() owns both descriptors returned by connectTcp() and closes each one.
-    close(localSocket);
+    closeAllLocalStreams(localStreams);
     close(tunnelSocket);
     return relaySucceeded ? 0 : 1;
 }

@@ -1,345 +1,574 @@
 // NexusProxy edge server
 //
-// This program keeps one developer tunnel and one public connection open. It
-// notifies the developer client, then relays bytes in both directions between
-// the public connection and the developer tunnel.
+// The edge keeps one developer tunnel open and multiplexes every public TCP
+// connection through it. Protocol stream IDs keep each conversation separate.
 
-#include <cerrno>  // errno and EINTR identify an interrupted send().
+#include "protocol.hpp"
+
+#include <cerrno>
 #include <csignal>
-#include <cstddef> // std::size_t stores buffer lengths and byte counts.
-#include <cstring> // std::strerror() turns errno into a readable message.
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
 #include <iostream>
-#include <sys/socket.h> // socket(), setsockopt(), bind(), listen(), and accept().
-#include <netinet/in.h> // sockaddr_in, INADDR_ANY, and htons().
-#include <unistd.h>     // close() releases a socket descriptor.
-#include <poll.h>       // poll() watches several sockets at the same time.
+#include <limits>
+#include <netinet/in.h>
+#include <poll.h>
+#include <span>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-// This builds a passive TCP listening socket for one local port. On success the
-// caller owns the returned descriptor and must eventually close it.
+namespace {
+
+constexpr int kTunnelPort = 7000;
+constexpr int kPublicPort = 8000;
+constexpr std::size_t kReadBufferSize = 16 * 1024;
+constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
+constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
+constexpr std::size_t kTunnelControlReserve = 64 * 1024;
+
+// A non-blocking send may stop halfway through a buffer. offset remembers the
+// first unsent byte so the next POLLOUT event can continue from that position.
+struct OutputQueue {
+    std::vector<std::uint8_t> bytes;
+    std::size_t offset{};
+
+    bool empty() const {
+        return offset == bytes.size();
+    }
+
+    std::size_t pending() const {
+        return bytes.size() - offset;
+    }
+
+    bool canAppend(std::size_t count, std::size_t limit) const {
+        return count <= limit && pending() <= limit - count;
+    }
+
+    bool append(std::span<const std::uint8_t> data, std::size_t limit) {
+        if (!canAppend(data.size(), limit)) {
+            return false;
+        }
+        if (empty()) {
+            bytes.clear();
+            offset = 0;
+        } else if (bytes.size() + data.size() > limit && offset != 0) {
+            bytes.erase(bytes.begin(), bytes.begin() + offset);
+            offset = 0;
+        }
+        bytes.insert(bytes.end(), data.begin(), data.end());
+        return true;
+    }
+
+    void consume(std::size_t count) {
+        offset += count;
+        if (empty()) {
+            bytes.clear();
+            offset = 0;
+        } else if (offset >= 4096 && offset * 2 >= bytes.size()) {
+            bytes.erase(bytes.begin(), bytes.begin() + offset);
+            offset = 0;
+        }
+    }
+
+    void clear() {
+        bytes.clear();
+        offset = 0;
+    }
+};
+
+struct PublicStream {
+    int socket{-1};
+    OutputQueue output;
+    // CLOSE may arrive after DATA that is still queued. Delay close() until the
+    // final bytes reach the public user.
+    bool closeAfterFlush{};
+};
+
+enum class FlushResult {
+    Ready,
+    Closed,
+    Error,
+};
+
+bool setNonBlocking(int socketFd) {
+    const int flags = fcntl(socketFd, F_GETFL, 0);
+    if (flags == -1 || fcntl(socketFd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        return false;
+    }
+    return true;
+}
+
 int createListener(int port) {
-    // AF_INET means IPv4 and SOCK_STREAM means TCP. The final 0 asks the OS for
-    // the default protocol. socket() creates the endpoint, but it is not bound,
-    // listening, or connected yet.
-    int tcpListenerSocket = socket(AF_INET, SOCK_STREAM, 0);
-
-    if (tcpListenerSocket == -1) {
-        std::cerr << "Failed to create socket" << std::endl;
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener == -1) {
+        std::cerr << "Failed to create listener for port " << port << std::endl;
         return -1;
     }
 
-    // SO_REUSEADDR makes restarting the server less likely to fail because the
-    // local address is still tied to an earlier connection. It does not make it
-    // safe for two active servers to own the same address and port.
     int option = 1;
-    if (setsockopt(tcpListenerSocket, SOL_SOCKET, SO_REUSEADDR,
-                   &option, sizeof(option)) == -1) {
-        std::cerr << "Failed to set socket options" << std::endl;
-        close(tcpListenerSocket);
+    if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &option,
+                   sizeof(option)) == -1) {
+        std::cerr << "Failed to set SO_REUSEADDR on port " << port << std::endl;
+        close(listener);
         return -1;
     }
 
-    // `{}` starts every field at zero. INADDR_ANY means this server accepts
-    // connections through its local IPv4 interfaces, not one specific local IP.
-    // htons() stores the port in the byte order used by network protocols.
-    struct sockaddr_in serverAddress{};
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
-    serverAddress.sin_port = htons(port);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
 
-    // bind() assigns this local address and port to the socket. The cast changes
-    // my IPv4-specific address pointer to the general type required by the API;
-    // the size tells bind() how much address data it received.
-    if (bind(tcpListenerSocket, (struct sockaddr*)&serverAddress,
-             sizeof(serverAddress)) == -1) {
-        std::cerr << "Failed to bind port " << port << std::endl;
-        close(tcpListenerSocket);
+    if (bind(listener, reinterpret_cast<sockaddr*>(&address),
+             sizeof(address)) == -1) {
+        std::cerr << "Failed to bind port " << port << ": "
+                  << std::strerror(errno) << std::endl;
+        close(listener);
         return -1;
     }
-
-    // listen() changes the bound socket into a passive listener. The value 5 is
-    // the requested queue size for connections waiting to be accepted.
-    if (listen(tcpListenerSocket, 5) == -1) {
-        std::cerr << "Failed to listen on port " << port << std::endl;
-        close(tcpListenerSocket);
+    if (listen(listener, SOMAXCONN) == -1 || !setNonBlocking(listener)) {
+        std::cerr << "Failed to prepare listener on port " << port << std::endl;
+        close(listener);
         return -1;
     }
 
     std::cout << "Listening on port " << port << std::endl;
-    // Returning transfers ownership to main(); this function must not close a
-    // successfully created listener.
-    return tcpListenerSocket;
+    return listener;
 }
 
-// send() may write fewer bytes than requested, even when it succeeds. This
-// helper will hide that detail from the notification and relay code.
-bool sendAll(int socketFd, const char* data, std::size_t length) {
-    std::size_t bytesSent = 0;
-
-    while (bytesSent < length) {
-        // Skip the bytes already written and give send() only the remaining
-        // part of the buffer. One successful call may still write only part.
-        ssize_t result = send(socketFd, data + bytesSent, length - bytesSent, 0);
-
-        if (result == -1) {
-            if (errno == EINTR) {
-                // A signal interrupted send() before completion, so try again.
-                continue;
-            }
-
-            return false;
-        }
-
-        // No progress means the complete buffer cannot be delivered.
-        if (result == 0) {
-            std::cerr << "send() made no progress\n";
-            return false;
-        }
-
-        bytesSent += static_cast<std::size_t>(result);
+bool queueFrame(OutputQueue& output, const nexus::protocol::Frame& frame,
+                std::size_t limit) {
+    std::vector<std::uint8_t> encoded;
+    if (!nexus::protocol::encodeFrame(frame, encoded)) {
+        return false;
     }
-
-    // Reaching this point means every requested byte was accepted by the socket.
-    return true;
+    return output.append(encoded, limit);
 }
 
-int main() {
-    // Make a failed send() return -1 instead of terminating the whole process.
-    std::signal(SIGPIPE, SIG_IGN);
+// Leave room for one DATA frame plus control frames such as CLOSE. When this is
+// false, poll() temporarily stops requesting reads from public sockets.
+bool tunnelCanAcceptData(const OutputQueue& output) {
+    constexpr std::size_t required = nexus::protocol::kFrameHeaderSize +
+                                     kReadBufferSize + kTunnelControlReserve;
+    return output.canAppend(required, kMaxTunnelQueueBytes);
+}
 
-    // Port 7000 is currently intended for the developer client's tunnel.
-    int socket7000 = createListener(7000);
-    if (socket7000 == -1) {
-        std::cerr << "Failed to create listener on port 7000" << std::endl;
-        return 1;
+FlushResult flushOutput(int socketFd, OutputQueue& output) {
+    while (!output.empty()) {
+        const ssize_t sent = send(
+            socketFd, output.bytes.data() + output.offset, output.pending(), 0);
+        if (sent > 0) {
+            output.consume(static_cast<std::size_t>(sent));
+            continue;
+        }
+        if (sent == 0) {
+            return FlushResult::Closed;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return FlushResult::Ready;
+        }
+        return FlushResult::Error;
     }
+    return FlushResult::Ready;
+}
 
-    // Port 8000 is currently the public-facing listener. This is still a second
-    // listening socket; it is not the local application behind client.cpp.
-    int socket8000 = createListener(8000);
-    if (socket8000 == -1) {
-        std::cerr << "Failed to create listener on port 8000" << std::endl;
-        close(socket7000);
-        return 1;
+void removePublicStream(
+    std::unordered_map<std::uint32_t, PublicStream>& streams,
+    std::uint32_t streamId) {
+    const auto stream = streams.find(streamId);
+    if (stream == streams.end()) {
+        return;
     }
+    close(stream->second.socket);
+    streams.erase(stream);
+    std::cout << "Closed public stream " << streamId << std::endl;
+}
 
-    // -1 means no developer client is connected yet. This is separate from
-    // socket7000: socket7000 listens for clients, while tunnelSocket will hold
-    // the connection returned by accept().
-    int tunnelSocket = -1;
+void closeAllPublicStreams(
+    std::unordered_map<std::uint32_t, PublicStream>& streams) {
+    for (auto& [streamId, stream] : streams) {
+        close(stream.socket);
+        std::cout << "Closed public stream " << streamId << std::endl;
+    }
+    streams.clear();
+}
 
-    // The public descriptor must also survive after the accept block finishes.
-    int publicSocket = -1;
-
-    // The first two entries watch the listeners. The other entries become active
-    // after accept() creates the tunnel and public connections.
-    struct pollfd fds[4]{};
-    fds[0].fd = socket7000; // Watch for a developer client trying to connect.
-    fds[0].events = POLLIN;
-    fds[1].fd = socket8000; // Watch for a public user trying to connect.
-    fds[1].events = POLLIN;
-    // poll() ignores negative descriptors, so this entry stays inactive until a
-    // developer client connects.
-    fds[2].fd = -1;
-    fds[2].events = POLLIN; // Watch for data or disconnect on the tunnel.
-    fds[3].fd = -1;
-    fds[3].events = POLLIN; // Watch for request bytes from the public user.
+std::uint32_t allocateStreamId(
+    std::uint32_t& nextStreamId,
+    const std::unordered_map<std::uint32_t, PublicStream>& streams) {
+    if (streams.size() >= std::numeric_limits<std::uint32_t>::max() - 1ULL) {
+        return 0;
+    }
 
     while (true) {
-        // The count is 4 because poll() checks every entry in fds. The final -1
-        // means wait indefinitely until one of those descriptors has an event.
-        int result = poll(fds, 4, -1);
+        const std::uint32_t candidate = nextStreamId++;
+        if (nextStreamId == 0) {
+            nextStreamId = 1;
+        }
+        if (candidate != 0 && !streams.contains(candidate)) {
+            return candidate;
+        }
+    }
+}
 
-        if (result == -1) {
-            std::cerr << "Poll failed" << std::endl;
+bool queueClose(OutputQueue& tunnelOutput, std::uint32_t streamId) {
+    return queueFrame(tunnelOutput,
+                      {nexus::protocol::MessageType::Close, streamId, {}},
+                      kMaxTunnelQueueBytes);
+}
+
+void finishPublicStream(
+    std::unordered_map<std::uint32_t, PublicStream>& streams,
+    OutputQueue& tunnelOutput, std::uint32_t streamId, bool notifyClient) {
+    if (notifyClient && !queueClose(tunnelOutput, streamId)) {
+        std::cerr << "Failed to encode CLOSE for stream " << streamId
+                  << std::endl;
+    }
+    removePublicStream(streams, streamId);
+}
+
+bool handleTunnelFrames(
+    nexus::protocol::FrameDecoder& decoder,
+    std::unordered_map<std::uint32_t, PublicStream>& streams,
+    OutputQueue& tunnelOutput) {
+    while (true) {
+        nexus::protocol::Frame frame;
+        const auto status = decoder.nextFrame(frame);
+        if (status == nexus::protocol::DecodeStatus::NeedMoreData) {
+            return true;
+        }
+        if (status == nexus::protocol::DecodeStatus::ProtocolError) {
+            std::cerr << "Tunnel protocol error: " << decoder.error() << std::endl;
+            return false;
+        }
+
+        const auto stream = streams.find(frame.streamId);
+        if (stream == streams.end()) {
+            if (frame.type == nexus::protocol::MessageType::Data) {
+                queueClose(tunnelOutput, frame.streamId);
+            }
+            continue;
+        }
+
+        if (frame.type == nexus::protocol::MessageType::Data) {
+            if (!stream->second.output.append(frame.payload,
+                                               kMaxStreamQueueBytes)) {
+                std::cerr << "Public stream " << frame.streamId
+                          << " exceeded its output limit" << std::endl;
+                queueClose(tunnelOutput, frame.streamId);
+                removePublicStream(streams, frame.streamId);
+            }
+            continue;
+        }
+        if (frame.type == nexus::protocol::MessageType::Close) {
+            if (stream->second.output.empty()) {
+                removePublicStream(streams, frame.streamId);
+            } else {
+                stream->second.closeAfterFlush = true;
+            }
+            continue;
+        }
+
+        std::cerr << "Unexpected frame type from developer client" << std::endl;
+        return false;
+    }
+}
+
+struct WatchedStream {
+    std::uint32_t streamId{};
+    std::size_t pollIndex{};
+};
+
+} // namespace
+
+int main() {
+    std::signal(SIGPIPE, SIG_IGN);
+
+    const int tunnelListener = createListener(kTunnelPort);
+    if (tunnelListener == -1) {
+        return 1;
+    }
+    const int publicListener = createListener(kPublicPort);
+    if (publicListener == -1) {
+        close(tunnelListener);
+        return 1;
+    }
+
+    int tunnelSocket = -1;
+    std::uint32_t nextStreamId = 1;
+    std::unordered_map<std::uint32_t, PublicStream> publicStreams;
+    nexus::protocol::FrameDecoder tunnelDecoder;
+    OutputQueue tunnelOutput;
+    bool running = true;
+
+    auto disconnectTunnel = [&] {
+        if (tunnelSocket != -1) {
+            close(tunnelSocket);
+            tunnelSocket = -1;
+        }
+        tunnelOutput.clear();
+        tunnelDecoder = nexus::protocol::FrameDecoder{};
+        closeAllPublicStreams(publicStreams);
+        std::cout << "Tunnel disconnected; waiting for a developer client"
+                  << std::endl;
+    };
+
+    while (running) {
+        std::vector<pollfd> pollFds;
+        pollFds.push_back({tunnelListener, POLLIN, 0});
+        const short publicListenerEvents =
+            tunnelSocket != -1 && tunnelCanAcceptData(tunnelOutput) ? POLLIN : 0;
+        pollFds.push_back({publicListener, publicListenerEvents, 0});
+
+        std::size_t tunnelPollIndex = std::numeric_limits<std::size_t>::max();
+        if (tunnelSocket != -1) {
+            tunnelPollIndex = pollFds.size();
+            short events = POLLIN;
+            if (!tunnelOutput.empty()) {
+                events |= POLLOUT;
+            }
+            pollFds.push_back({tunnelSocket, events, 0});
+        }
+
+        std::vector<WatchedStream> watchedStreams;
+        watchedStreams.reserve(publicStreams.size());
+        for (const auto& [streamId, stream] : publicStreams) {
+            short events =
+                !stream.closeAfterFlush && tunnelCanAcceptData(tunnelOutput)
+                    ? POLLIN
+                    : 0;
+            if (!stream.output.empty()) {
+                events |= POLLOUT;
+            }
+            watchedStreams.push_back({streamId, pollFds.size()});
+            pollFds.push_back({stream.socket, events, 0});
+        }
+
+        int ready;
+        do {
+            ready = poll(pollFds.data(), pollFds.size(), -1);
+        } while (ready == -1 && errno == EINTR);
+
+        if (ready == -1) {
+            std::cerr << "poll() failed: " << std::strerror(errno) << std::endl;
             break;
         }
 
-        // POLLIN on a listening socket means a connection is ready to accept;
-        // it does not mean normal application bytes are ready on this listener.
-        if (fds[0].revents & POLLIN) {
-            std::cout << "Connection waiting on port 7000" << std::endl;
-            // accept() receives the listening descriptor and creates a new
-            // descriptor for this one connection. socket7000 remains a listener.
-            int acceptedTunnel = accept(socket7000, nullptr, nullptr);
+        if (pollFds[0].revents & POLLIN) {
+            while (true) {
+                const int accepted = accept(tunnelListener, nullptr, nullptr);
+                if (accepted == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        std::cerr << "Failed to accept tunnel: "
+                                  << std::strerror(errno) << std::endl;
+                    }
+                    break;
+                }
 
-            if (acceptedTunnel == -1) {
-                std::cerr << "Failed to accept connection on port 7000" << std::endl;
-            } else if (tunnelSocket != -1) {
-                // This version supports one developer tunnel. Rejecting a second
-                // client avoids silently replacing the connection we already own.
-                std::cout << "A tunnel is already connected; rejecting the new client"
-                          << std::endl;
-                close(acceptedTunnel);
-            } else {
-                // Store the accepted descriptor instead of closing it here. The
-                // server now owns it and keeps it for the future relay step.
-                tunnelSocket = acceptedTunnel;
-                // fds[2] now watches this connected socket. fds[0] must continue
-                // watching socket7000 so future connection attempts are noticed.
-                fds[2].fd = tunnelSocket;
-                std::cout << "Accepted and retained tunnel connection on port 7000"
-                          << std::endl;
-            }
-        }
-
-        // This repeats the same accept flow for the public listener. The two
-        // accepted descriptors belong to separate TCP connections.
-        if (fds[1].revents & POLLIN) {
-            std::cout << "Connection waiting on port 8000" << std::endl;
-            int acceptedPublic = accept(socket8000, nullptr, nullptr);
-
-            if (acceptedPublic == -1) {
-                std::cerr << "Failed to accept connection on port 8000" << std::endl;
-            } else if (tunnelSocket == -1) {
-                // There is nowhere to route public traffic without a tunnel.
-                std::cerr << "No tunnel connected; rejecting public connection on port 8000"
-                          << std::endl;
-                close(acceptedPublic);
-            } else if (publicSocket != -1) {
-                // This milestone supports only one public connection at a time.
-                std::cerr << "A public connection is already retained; rejecting the new client on port 8000"
-                          << std::endl;
-                close(acceptedPublic);
-            } else {
-                publicSocket = acceptedPublic;
-
-                // 'O' tells the developer client that a public socket is ready.
-                // sendAll() also stays correct if this message later grows and
-                // one send() writes only part of it.
-                const char signal = 'O';
-
-                if (!sendAll(tunnelSocket, &signal, sizeof(signal))) {
-                    std::cerr << "Failed to notify developer client" << std::endl;
-                    close(publicSocket);
-                    publicSocket = -1;
-                    close(tunnelSocket);
-                    tunnelSocket = -1;
-                    fds[2].fd = -1;
-                } else {
-                    // fds[3] lets later poll() calls report every incoming chunk
-                    // instead of blocking inside this accept branch.
-                    fds[3].fd = publicSocket;
-                    std::cout << "Retained public connection and notified developer client"
+                if (tunnelSocket != -1) {
+                    std::cerr << "A tunnel is already connected; rejecting another"
                               << std::endl;
+                    close(accepted);
+                } else if (!setNonBlocking(accepted)) {
+                    std::cerr << "Failed to make tunnel non-blocking" << std::endl;
+                    close(accepted);
+                } else {
+                    tunnelSocket = accepted;
+                    std::cout << "Developer tunnel connected" << std::endl;
                 }
             }
         }
 
-        if (publicSocket != -1 &&
-            (fds[3].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-            char buffer[4096];
-            ssize_t bytesReceived;
+        if (pollFds[1].revents & POLLIN) {
+            while (true) {
+                const int accepted = accept(publicListener, nullptr, nullptr);
+                if (accepted == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        std::cerr << "Failed to accept public connection: "
+                                  << std::strerror(errno) << std::endl;
+                    }
+                    break;
+                }
 
-            // Retry the same read when a signal interrupts recv().
-            do {
-                bytesReceived = recv(publicSocket, buffer, sizeof(buffer), 0);
-            } while (bytesReceived == -1 && errno == EINTR);
-
-            if (bytesReceived > 0) {
-                if (!sendAll(tunnelSocket, buffer,
-                             static_cast<std::size_t>(bytesReceived))) {
-                    std::cerr << "Failed to send public data through the tunnel"
+                if (tunnelSocket == -1) {
+                    std::cerr << "No tunnel connected; rejecting public connection"
                               << std::endl;
-                    close(publicSocket);
-                    publicSocket = -1;
-                    fds[3].fd = -1;
-                    close(tunnelSocket);
-                    tunnelSocket = -1;
-                    fds[2].fd = -1;
-                } else {
-                    std::cout << "Sent " << bytesReceived
-                              << " public bytes through the tunnel" << std::endl;
+                    close(accepted);
+                    continue;
                 }
-            } else {
-                if (bytesReceived == 0) {
-                    std::cout << "Public connection closed by client" << std::endl;
-                } else {
-                    std::cerr << "Failed to receive public data: "
-                              << std::strerror(errno) << std::endl;
+                if (!setNonBlocking(accepted)) {
+                    std::cerr << "Failed to make public socket non-blocking"
+                              << std::endl;
+                    close(accepted);
+                    continue;
                 }
 
-                close(publicSocket);
-                publicSocket = -1;
-                fds[3].fd = -1;
+                const std::uint32_t streamId =
+                    allocateStreamId(nextStreamId, publicStreams);
+                if (streamId == 0) {
+                    std::cerr << "No stream IDs are available" << std::endl;
+                    close(accepted);
+                    continue;
+                }
 
-                // This first relay version uses one tunnel per public connection.
-                // Closing it tells the developer client that this stream ended.
-                close(tunnelSocket);
-                tunnelSocket = -1;
-                fds[2].fd = -1;
+                publicStreams.emplace(streamId, PublicStream{accepted, {}, false});
+                if (!queueFrame(tunnelOutput,
+                                {nexus::protocol::MessageType::Open,
+                                 streamId, {}},
+                                kMaxTunnelQueueBytes)) {
+                    removePublicStream(publicStreams, streamId);
+                    continue;
+                }
+                std::cout << "Opened public stream " << streamId << std::endl;
             }
         }
 
-        // Tunnel data here is the local service's response for the public user.
         if (tunnelSocket != -1 &&
-            (fds[2].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-            char buffer[4096];
-            ssize_t bytesReceived;
+            tunnelPollIndex != std::numeric_limits<std::size_t>::max()) {
+            const short events = pollFds[tunnelPollIndex].revents;
 
-            do {
-                bytesReceived = recv(tunnelSocket, buffer, sizeof(buffer), 0);
-            } while (bytesReceived == -1 && errno == EINTR);
-
-            if (bytesReceived > 0) {
-                // A response has nowhere to go if its public connection is gone.
-                if (publicSocket == -1) {
-                    std::cerr << "Received tunnel data without a public connection"
-                              << std::endl;
-                    close(tunnelSocket);
-                    tunnelSocket = -1;
-                    fds[2].fd = -1;
-                } else if (!sendAll(publicSocket, buffer,
-                                    static_cast<std::size_t>(bytesReceived))) {
-                    std::cerr << "Failed to send tunnel data to public client"
-                              << std::endl;
-                    close(publicSocket);
-                    publicSocket = -1;
-                    fds[3].fd = -1;
-                    close(tunnelSocket);
-                    tunnelSocket = -1;
-                    fds[2].fd = -1;
-                } else {
-                    std::cout << "Sent " << bytesReceived
-                              << " response bytes to public client" << std::endl;
+            if (events & POLLOUT) {
+                if (flushOutput(tunnelSocket, tunnelOutput) != FlushResult::Ready) {
+                    disconnectTunnel();
                 }
-            } else {
-                if (bytesReceived == 0) {
-                    std::cout << "Tunnel disconnected; waiting for a new client"
+            }
+
+            if (tunnelSocket != -1 && (events & (POLLIN | POLLHUP))) {
+                std::uint8_t buffer[kReadBufferSize];
+                while (true) {
+                    const ssize_t received =
+                        recv(tunnelSocket, buffer, sizeof(buffer), 0);
+                    if (received > 0) {
+                        tunnelDecoder.append(std::span<const std::uint8_t>(
+                            buffer, static_cast<std::size_t>(received)));
+                        if (!handleTunnelFrames(tunnelDecoder, publicStreams,
+                                                tunnelOutput)) {
+                            disconnectTunnel();
+                            break;
+                        }
+                        continue;
+                    }
+                    if (received == 0) {
+                        disconnectTunnel();
+                        break;
+                    }
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break;
+                    }
+                    std::cerr << "Tunnel recv() failed: " << std::strerror(errno)
                               << std::endl;
-                } else {
-                    std::cerr << "Failed to receive tunnel data: "
+                    disconnectTunnel();
+                    break;
+                }
+            }
+
+            if (tunnelSocket != -1 && (events & (POLLERR | POLLNVAL))) {
+                disconnectTunnel();
+            }
+        }
+
+        for (const WatchedStream watched : watchedStreams) {
+            const auto stream = publicStreams.find(watched.streamId);
+            if (stream == publicStreams.end()) {
+                continue;
+            }
+
+            const short events = pollFds[watched.pollIndex].revents;
+            if (events & POLLOUT) {
+                const FlushResult result =
+                    flushOutput(stream->second.socket, stream->second.output);
+                if (result != FlushResult::Ready) {
+                    finishPublicStream(publicStreams, tunnelOutput,
+                                       watched.streamId, tunnelSocket != -1);
+                    continue;
+                }
+                if (stream->second.closeAfterFlush &&
+                    stream->second.output.empty()) {
+                    removePublicStream(publicStreams, watched.streamId);
+                    continue;
+                }
+            }
+
+            const auto current = publicStreams.find(watched.streamId);
+            if (current == publicStreams.end()) {
+                continue;
+            }
+
+            if (events & (POLLIN | POLLHUP)) {
+                std::uint8_t buffer[kReadBufferSize];
+                bool streamFinished = false;
+                while (!streamFinished) {
+                    if (!tunnelCanAcceptData(tunnelOutput)) {
+                        break;
+                    }
+                    const ssize_t received =
+                        recv(current->second.socket, buffer, sizeof(buffer), 0);
+                    if (received > 0) {
+                        const nexus::protocol::Frame dataFrame{
+                            nexus::protocol::MessageType::Data,
+                            watched.streamId,
+                            {buffer, buffer + received}};
+                        if (!queueFrame(tunnelOutput, dataFrame,
+                                        kMaxTunnelQueueBytes)) {
+                            std::cerr << "Failed to encode DATA for stream "
+                                      << watched.streamId << std::endl;
+                            running = false;
+                            streamFinished = true;
+                        }
+                        continue;
+                    }
+                    if (received == 0) {
+                        finishPublicStream(publicStreams, tunnelOutput,
+                                           watched.streamId,
+                                           tunnelSocket != -1);
+                        streamFinished = true;
+                        continue;
+                    }
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        streamFinished = true;
+                        continue;
+                    }
+                    std::cerr << "Public recv() failed for stream "
+                              << watched.streamId << ": "
                               << std::strerror(errno) << std::endl;
+                    finishPublicStream(publicStreams, tunnelOutput,
+                                       watched.streamId, tunnelSocket != -1);
+                    streamFinished = true;
                 }
+            }
 
-                close(tunnelSocket);
-                tunnelSocket = -1;
-                fds[2].fd = -1;
-
-                // The public connection cannot continue without its tunnel.
-                if (publicSocket != -1) {
-                    close(publicSocket);
-                    publicSocket = -1;
-                    fds[3].fd = -1;
-                }
+            if (publicStreams.contains(watched.streamId) &&
+                (events & (POLLERR | POLLNVAL))) {
+                finishPublicStream(publicStreams, tunnelOutput,
+                                   watched.streamId, tunnelSocket != -1);
             }
         }
     }
 
-    // These lines run only after the loop ends because poll() reported an error.
-    // Release the connected tunnel first, if one was accepted, followed by the
-    // two listening descriptors owned by main().
     if (tunnelSocket != -1) {
         close(tunnelSocket);
-        std::cout << "Closed tunnel connection" << std::endl;
     }
-    if (publicSocket != -1) {
-        close(publicSocket);
-        std::cout << "Closed public connection" << std::endl;
-    }
-    close(socket7000);
-    std::cout << "Closed listener on port 7000" << std::endl;
-    close(socket8000);
-    std::cout << "Closed listener on port 8000" << std::endl;
-    // The current code returns 1 here, so even this cleanup path reports failure.
-    return 1;
+    closeAllPublicStreams(publicStreams);
+    close(tunnelListener);
+    close(publicListener);
+    return running ? 0 : 1;
 }
