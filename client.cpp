@@ -28,6 +28,9 @@ namespace {
 constexpr const char* kEdgeAddress = "127.0.0.1";
 constexpr int kTunnelPort = 7000;
 constexpr std::size_t kReadBufferSize = 16 * 1024;
+constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
+constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
+constexpr std::size_t kTunnelControlReserve = 64 * 1024;
 
 struct OutputQueue {
     std::vector<std::uint8_t> bytes;
@@ -41,12 +44,23 @@ struct OutputQueue {
         return bytes.size() - offset;
     }
 
-    void append(std::span<const std::uint8_t> data) {
+    bool canAppend(std::size_t count, std::size_t limit) const {
+        return count <= limit && pending() <= limit - count;
+    }
+
+    bool append(std::span<const std::uint8_t> data, std::size_t limit) {
+        if (!canAppend(data.size(), limit)) {
+            return false;
+        }
         if (empty()) {
             bytes.clear();
             offset = 0;
+        } else if (bytes.size() + data.size() > limit && offset != 0) {
+            bytes.erase(bytes.begin(), bytes.begin() + offset);
+            offset = 0;
         }
         bytes.insert(bytes.end(), data.begin(), data.end());
+        return true;
     }
 
     void consume(std::size_t count) {
@@ -105,18 +119,25 @@ int connectTcp(const char* address, int port) {
     return socketFd;
 }
 
-bool queueFrame(OutputQueue& output, const nexus::protocol::Frame& frame) {
+bool queueFrame(OutputQueue& output, const nexus::protocol::Frame& frame,
+                std::size_t limit) {
     std::vector<std::uint8_t> encoded;
     if (!nexus::protocol::encodeFrame(frame, encoded)) {
         return false;
     }
-    output.append(encoded);
-    return true;
+    return output.append(encoded, limit);
+}
+
+bool tunnelCanAcceptData(const OutputQueue& output) {
+    constexpr std::size_t required = nexus::protocol::kFrameHeaderSize +
+                                     kReadBufferSize + kTunnelControlReserve;
+    return output.canAppend(required, kMaxTunnelQueueBytes);
 }
 
 bool queueClose(OutputQueue& tunnelOutput, std::uint32_t streamId) {
     return queueFrame(tunnelOutput,
-                      {nexus::protocol::MessageType::Close, streamId, {}});
+                      {nexus::protocol::MessageType::Close, streamId, {}},
+                      kMaxTunnelQueueBytes);
 }
 
 FlushResult flushOutput(int socketFd, OutputQueue& output) {
@@ -208,7 +229,13 @@ bool handleTunnelFrames(
         }
 
         if (frame.type == nexus::protocol::MessageType::Data) {
-            stream->second.output.append(frame.payload);
+            if (!stream->second.output.append(frame.payload,
+                                               kMaxStreamQueueBytes)) {
+                std::cerr << "Local stream " << frame.streamId
+                          << " exceeded its output limit" << std::endl;
+                queueClose(tunnelOutput, frame.streamId);
+                removeLocalStream(streams, frame.streamId);
+            }
             continue;
         }
         if (frame.type == nexus::protocol::MessageType::Close) {
@@ -286,7 +313,10 @@ int main(int argc, char* argv[]) {
         std::vector<WatchedStream> watchedStreams;
         watchedStreams.reserve(localStreams.size());
         for (const auto& [streamId, stream] : localStreams) {
-            short events = stream.closeAfterFlush ? 0 : POLLIN;
+            short events =
+                !stream.closeAfterFlush && tunnelCanAcceptData(tunnelOutput)
+                    ? POLLIN
+                    : 0;
             if (!stream.output.empty()) {
                 events |= POLLOUT;
             }
@@ -387,6 +417,9 @@ int main(int argc, char* argv[]) {
                 std::uint8_t buffer[kReadBufferSize];
                 bool streamFinished = false;
                 while (!streamFinished) {
+                    if (!tunnelCanAcceptData(tunnelOutput)) {
+                        break;
+                    }
                     const ssize_t received =
                         recv(current->second.socket, buffer, sizeof(buffer), 0);
                     if (received > 0) {
@@ -394,7 +427,8 @@ int main(int argc, char* argv[]) {
                             nexus::protocol::MessageType::Data,
                             watched.streamId,
                             {buffer, buffer + received}};
-                        if (!queueFrame(tunnelOutput, dataFrame)) {
+                        if (!queueFrame(tunnelOutput, dataFrame,
+                                        kMaxTunnelQueueBytes)) {
                             std::cerr << "Failed to encode DATA for stream "
                                       << watched.streamId << std::endl;
                             relaySucceeded = false;
