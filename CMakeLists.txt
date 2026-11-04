@@ -114,4 +114,13 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:nexus-client>
     )
     set_tests_properties(integration_single_request PROPERTIES TIMEOUT 20)
+
+    add_test(
+        NAME integration_concurrent_streams
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrent_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_concurrent_streams PROPERTIES TIMEOUT 30)
 endif()
