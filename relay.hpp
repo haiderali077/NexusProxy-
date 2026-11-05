@@ -2,6 +2,7 @@
 
 #include "protocol.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -34,5 +35,7 @@ enum class FlushResult {
 bool queueFrame(OutputQueue& output, const protocol::Frame& frame,
                 std::size_t limit);
 FlushResult flushOutput(int socketFd, OutputQueue& output);
+bool drainOutput(int socketFd, OutputQueue& output,
+                 std::chrono::milliseconds timeout);
 
 } // namespace nexus::net

@@ -7,6 +7,7 @@
 #include "heartbeat.hpp"
 #include "protocol.hpp"
 #include "relay.hpp"
+#include "shutdown.hpp"
 #include "socket_utils.hpp"
 #include "unique_socket.hpp"
 
@@ -33,6 +34,7 @@ namespace {
 using namespace std::chrono_literals;
 
 using nexus::net::flushOutput;
+using nexus::net::drainOutput;
 using nexus::net::FlushResult;
 using nexus::net::OutputQueue;
 using nexus::net::queueFrame;
@@ -191,6 +193,10 @@ int pollTimeoutUntil(std::chrono::steady_clock::time_point deadline) {
 
 int main(int argc, char *argv[]) {
   std::signal(SIGPIPE, SIG_IGN);
+  if (!nexus::process::installShutdownHandlers()) {
+    std::cerr << "Failed to install shutdown signal handlers" << std::endl;
+    return 1;
+  }
 
   int tunnelPort = kTunnelPort;
   int publicPort = kPublicPort;
@@ -241,7 +247,7 @@ int main(int argc, char *argv[]) {
               << std::endl;
   };
 
-  while (running) {
+  while (running && !nexus::process::shutdownRequested()) {
     if (tunnelSocket && tunnelIdleDeadline &&
         std::chrono::steady_clock::now() >= *tunnelIdleDeadline) {
       std::cerr << "Tunnel was silent past its idle deadline" << std::endl;
@@ -282,7 +288,13 @@ int main(int argc, char *argv[]) {
                               ? pollTimeoutUntil(*tunnelIdleDeadline)
                               : -1;
       ready = poll(pollFds.data(), pollFds.size(), timeout);
-    } while (ready == -1 && errno == EINTR);
+    } while (ready == -1 && errno == EINTR &&
+             !nexus::process::shutdownRequested());
+
+    if (nexus::process::shutdownRequested()) {
+      // Break before processing ready listeners so shutdown accepts no new work.
+      break;
+    }
 
     if (ready == -1) {
       std::cerr << "poll() failed: " << std::strerror(errno) << std::endl;
@@ -290,7 +302,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (pollFds[0].revents & POLLIN) {
-      while (true) {
+      while (!nexus::process::shutdownRequested()) {
         UniqueSocket accepted{accept(tunnelListener.get(), nullptr, nullptr)};
         if (!accepted) {
           if (errno == EINTR) {
@@ -320,7 +332,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (pollFds[1].revents & POLLIN) {
-      while (true) {
+      while (!nexus::process::shutdownRequested()) {
         UniqueSocket accepted{accept(publicListener.get(), nullptr, nullptr)};
         if (!accepted) {
           if (errno == EINTR) {
@@ -489,6 +501,18 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  if (nexus::process::shutdownRequested() && tunnelSocket) {
+    for (const auto &[streamId, stream] : publicStreams) {
+      static_cast<void>(stream);
+      queueClose(tunnelOutput, streamId);
+    }
+    // Give CLOSE frames a brief chance to leave, then rely on RAII even if the
+    // peer is stalled. A shutdown path must have its own deadline too.
+    drainOutput(tunnelSocket.get(), tunnelOutput, 1s);
+  }
   closeAllPublicStreams(publicStreams);
+  if (nexus::process::shutdownRequested()) {
+    std::cout << "Edge shutdown complete" << std::endl;
+  }
   return running ? 0 : 1;
 }

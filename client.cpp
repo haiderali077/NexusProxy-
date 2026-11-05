@@ -8,6 +8,7 @@
 #include "protocol.hpp"
 #include "relay.hpp"
 #include "retry.hpp"
+#include "shutdown.hpp"
 #include "socket_utils.hpp"
 #include "unique_socket.hpp"
 
@@ -35,6 +36,7 @@
 namespace {
 
 using nexus::net::connectTcp;
+using nexus::net::drainOutput;
 using nexus::net::flushOutput;
 using nexus::net::FlushResult;
 using nexus::net::OutputQueue;
@@ -190,7 +192,12 @@ void waitBeforeReconnect(ReconnectBackoff &backoff, std::string_view reason) {
   const std::chrono::milliseconds delay = backoff.nextDelay();
   std::cout << reason << "; reconnecting in " << delay.count() << " ms"
             << std::endl;
-  std::this_thread::sleep_for(delay);
+  const auto deadline = std::chrono::steady_clock::now() + delay;
+  while (!nexus::process::shutdownRequested() &&
+         std::chrono::steady_clock::now() < deadline) {
+    // Short sleeps let SIGINT and SIGTERM interrupt even the longest backoff.
+    std::this_thread::sleep_for(100ms);
+  }
 }
 
 int pollTimeoutUntil(std::chrono::steady_clock::time_point deadline) {
@@ -207,6 +214,10 @@ int pollTimeoutUntil(std::chrono::steady_clock::time_point deadline) {
 
 int main(int argc, char *argv[]) {
   std::signal(SIGPIPE, SIG_IGN);
+  if (!nexus::process::installShutdownHandlers()) {
+    std::cerr << "Failed to install shutdown signal handlers" << std::endl;
+    return 1;
+  }
 
   const char *localAddress = "127.0.0.1";
   int localPort = 9000;
@@ -242,7 +253,7 @@ int main(int argc, char *argv[]) {
 
   // Every pass owns one complete tunnel session. Returning here after a
   // disconnect would make a temporary network problem stop the client.
-  while (true) {
+  while (!nexus::process::shutdownRequested()) {
     UniqueSocket tunnelSocket{
         connectTcp(edgeAddress, tunnelPort, kConnectTimeout)};
     if (!tunnelSocket) {
@@ -274,7 +285,7 @@ int main(int argc, char *argv[]) {
     auto nextHeartbeat = std::chrono::steady_clock::now();
     auto pongDeadline = nextHeartbeat;
 
-    while (sessionRunning) {
+    while (sessionRunning && !nexus::process::shutdownRequested()) {
       const auto now = std::chrono::steady_clock::now();
       if (awaitedPong && now >= pongDeadline) {
         std::cerr << "The edge did not answer PING before its deadline"
@@ -323,7 +334,12 @@ int main(int argc, char *argv[]) {
         const auto wakeDeadline = awaitedPong ? pongDeadline : nextHeartbeat;
         ready = poll(pollFds.data(), pollFds.size(),
                      pollTimeoutUntil(wakeDeadline));
-      } while (ready == -1 && errno == EINTR);
+      } while (ready == -1 && errno == EINTR &&
+               !nexus::process::shutdownRequested());
+
+      if (nexus::process::shutdownRequested()) {
+        break;
+      }
 
       if (ready == -1) {
         std::cerr << "poll() failed: " << std::strerror(errno) << std::endl;
@@ -461,9 +477,24 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    if (nexus::process::shutdownRequested()) {
+      // Tell the edge which streams are ending, but never let shutdown wait
+      // forever for a peer that may already be gone.
+      for (const auto &[streamId, stream] : localStreams) {
+        static_cast<void>(stream);
+        queueClose(tunnelOutput, streamId);
+      }
+      drainOutput(tunnelSocket.get(), tunnelOutput, 1s);
+      closeAllLocalStreams(localStreams);
+      break;
+    }
+
     closeAllLocalStreams(localStreams);
     waitBeforeReconnect(reconnectBackoff, relaySucceeded
                                               ? "Tunnel disconnected"
                                               : "Tunnel session failed");
   }
+
+  std::cout << "Client shutdown complete" << std::endl;
+  return 0;
 }

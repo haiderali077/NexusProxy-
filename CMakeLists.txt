@@ -55,6 +55,7 @@ add_library(nexus_runtime STATIC
     heartbeat.cpp
     relay.cpp
     retry.cpp
+    shutdown.cpp
     socket_utils.cpp
     unique_socket.cpp
 )
@@ -138,6 +139,16 @@ if(BUILD_TESTING)
     )
     add_test(NAME heartbeat_tests COMMAND heartbeat_tests)
 
+    add_executable(shutdown_tests
+        shutdown_tests.cpp
+    )
+    target_link_libraries(shutdown_tests PRIVATE
+        nexus_runtime
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(NAME shutdown_tests COMMAND shutdown_tests)
+
     add_test(
         NAME integration_single_request
         COMMAND ${Python3_EXECUTABLE}
@@ -191,6 +202,15 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:nexus-client>
     )
     set_tests_properties(integration_timeouts PROPERTIES TIMEOUT 35)
+
+    add_test(
+        NAME integration_graceful_shutdown
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shutdown_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_graceful_shutdown PROPERTIES TIMEOUT 20)
 
     add_test(
         NAME integration_protocol_and_limits
