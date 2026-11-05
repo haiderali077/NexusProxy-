@@ -4,12 +4,14 @@
 // separate connection to the local service, and stream IDs route DATA frames.
 
 #include "config.hpp"
+#include "heartbeat.hpp"
 #include "protocol.hpp"
 #include "relay.hpp"
 #include "retry.hpp"
 #include "socket_utils.hpp"
 #include "unique_socket.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -48,6 +50,7 @@ constexpr std::size_t kReadBufferSize = 16 * 1024;
 constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
 constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
 constexpr std::size_t kTunnelControlReserve = 64 * 1024;
+constexpr auto kHeartbeatInterval = 5s;
 
 struct LocalStream {
   UniqueSocket socket;
@@ -98,6 +101,11 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
     if (status == nexus::protocol::DecodeStatus::ProtocolError) {
       std::cerr << "Tunnel protocol error: " << decoder.error() << std::endl;
       return false;
+    }
+
+    if (frame.type == nexus::protocol::MessageType::Pong) {
+      // PONG belongs to the tunnel itself, not one of the local streams.
+      continue;
     }
 
     if (frame.type == nexus::protocol::MessageType::Open) {
@@ -170,6 +178,16 @@ void waitBeforeReconnect(ReconnectBackoff &backoff, std::string_view reason) {
   std::this_thread::sleep_for(delay);
 }
 
+int pollTimeoutUntil(std::chrono::steady_clock::time_point deadline) {
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now());
+  if (remaining <= 0ms) {
+    return 0;
+  }
+  return static_cast<int>(std::min<std::int64_t>(
+      remaining.count(), std::numeric_limits<int>::max()));
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -235,8 +253,24 @@ int main(int argc, char *argv[]) {
     OutputQueue tunnelOutput;
     bool relaySucceeded = true;
     bool sessionRunning = true;
+    std::uint64_t heartbeatToken = 1;
+    auto nextHeartbeat = std::chrono::steady_clock::now() + kHeartbeatInterval;
 
     while (sessionRunning) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= nextHeartbeat) {
+        const nexus::protocol::Frame ping{
+            nexus::protocol::MessageType::Ping, 0,
+            nexus::reliability::encodeHeartbeatToken(heartbeatToken++)};
+        if (!queueFrame(tunnelOutput, ping, kMaxTunnelQueueBytes)) {
+          std::cerr << "Could not queue PING; tunnel output is full"
+                    << std::endl;
+          relaySucceeded = false;
+          break;
+        }
+        nextHeartbeat = now + kHeartbeatInterval;
+      }
+
       std::vector<pollfd> pollFds;
       short tunnelEvents = POLLIN;
       if (!tunnelOutput.empty()) {
@@ -260,7 +294,8 @@ int main(int argc, char *argv[]) {
 
       int ready;
       do {
-        ready = poll(pollFds.data(), pollFds.size(), -1);
+        ready = poll(pollFds.data(), pollFds.size(),
+                     pollTimeoutUntil(nextHeartbeat));
       } while (ready == -1 && errno == EINTR);
 
       if (ready == -1) {
