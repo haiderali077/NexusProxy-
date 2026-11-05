@@ -20,6 +20,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <poll.h>
 #include <span>
 #include <string>
@@ -51,6 +52,8 @@ constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
 constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
 constexpr std::size_t kTunnelControlReserve = 64 * 1024;
 constexpr auto kHeartbeatInterval = 5s;
+constexpr auto kPongTimeout = 15s;
+constexpr auto kConnectTimeout = 5s;
 
 struct LocalStream {
   UniqueSocket socket;
@@ -91,7 +94,9 @@ void closeAllLocalStreams(
 bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
                         std::unordered_map<std::uint32_t, LocalStream> &streams,
                         OutputQueue &tunnelOutput, const char *localAddress,
-                        int localPort) {
+                        int localPort,
+                        std::optional<std::uint64_t> &awaitedPong,
+                        std::chrono::steady_clock::time_point &nextHeartbeat) {
   while (true) {
     nexus::protocol::Frame frame;
     const auto status = decoder.nextFrame(frame);
@@ -104,7 +109,16 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
     }
 
     if (frame.type == nexus::protocol::MessageType::Pong) {
-      // PONG belongs to the tunnel itself, not one of the local streams.
+      std::uint64_t token = 0;
+      if (!nexus::reliability::decodeHeartbeatToken(frame.payload, token) ||
+          !awaitedPong || token != *awaitedPong) {
+        std::cerr << "Received a PONG that does not match the active PING"
+                  << std::endl;
+        return false;
+      }
+      // A matching reply proves this tunnel can still carry data both ways.
+      awaitedPong.reset();
+      nextHeartbeat = std::chrono::steady_clock::now() + kHeartbeatInterval;
       continue;
     }
 
@@ -115,7 +129,8 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
         return false;
       }
 
-      UniqueSocket localSocket{connectTcp(localAddress, localPort)};
+      UniqueSocket localSocket{
+          connectTcp(localAddress, localPort, kConnectTimeout)};
       if (!localSocket) {
         std::cerr << "Failed to connect stream " << frame.streamId << " to "
                   << localAddress << ':' << localPort << ": "
@@ -228,7 +243,8 @@ int main(int argc, char *argv[]) {
   // Every pass owns one complete tunnel session. Returning here after a
   // disconnect would make a temporary network problem stop the client.
   while (true) {
-    UniqueSocket tunnelSocket{connectTcp(edgeAddress, tunnelPort)};
+    UniqueSocket tunnelSocket{
+        connectTcp(edgeAddress, tunnelPort, kConnectTimeout)};
     if (!tunnelSocket) {
       std::cerr << "Failed to connect to edge " << edgeAddress << ':'
                 << tunnelPort << ": " << std::strerror(errno) << std::endl;
@@ -254,21 +270,31 @@ int main(int argc, char *argv[]) {
     bool relaySucceeded = true;
     bool sessionRunning = true;
     std::uint64_t heartbeatToken = 1;
-    auto nextHeartbeat = std::chrono::steady_clock::now() + kHeartbeatInterval;
+    std::optional<std::uint64_t> awaitedPong;
+    auto nextHeartbeat = std::chrono::steady_clock::now();
+    auto pongDeadline = nextHeartbeat;
 
     while (sessionRunning) {
       const auto now = std::chrono::steady_clock::now();
-      if (now >= nextHeartbeat) {
+      if (awaitedPong && now >= pongDeadline) {
+        std::cerr << "The edge did not answer PING before its deadline"
+                  << std::endl;
+        relaySucceeded = false;
+        break;
+      }
+      if (!awaitedPong && now >= nextHeartbeat) {
+        const std::uint64_t token = heartbeatToken++;
         const nexus::protocol::Frame ping{
             nexus::protocol::MessageType::Ping, 0,
-            nexus::reliability::encodeHeartbeatToken(heartbeatToken++)};
+            nexus::reliability::encodeHeartbeatToken(token)};
         if (!queueFrame(tunnelOutput, ping, kMaxTunnelQueueBytes)) {
           std::cerr << "Could not queue PING; tunnel output is full"
                     << std::endl;
           relaySucceeded = false;
           break;
         }
-        nextHeartbeat = now + kHeartbeatInterval;
+        awaitedPong = token;
+        pongDeadline = now + kPongTimeout;
       }
 
       std::vector<pollfd> pollFds;
@@ -294,8 +320,9 @@ int main(int argc, char *argv[]) {
 
       int ready;
       do {
+        const auto wakeDeadline = awaitedPong ? pongDeadline : nextHeartbeat;
         ready = poll(pollFds.data(), pollFds.size(),
-                     pollTimeoutUntil(nextHeartbeat));
+                     pollTimeoutUntil(wakeDeadline));
       } while (ready == -1 && errno == EINTR);
 
       if (ready == -1) {
@@ -323,7 +350,8 @@ int main(int argc, char *argv[]) {
             tunnelDecoder.append(std::span<const std::uint8_t>(
                 buffer, static_cast<std::size_t>(received)));
             if (!handleTunnelFrames(tunnelDecoder, localStreams, tunnelOutput,
-                                    localAddress, localPort)) {
+                                    localAddress, localPort, awaitedPong,
+                                    nextHeartbeat)) {
               relaySucceeded = false;
               sessionRunning = false;
               break;

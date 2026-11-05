@@ -184,6 +184,15 @@ if(BUILD_TESTING)
     set_tests_properties(integration_heartbeat PROPERTIES TIMEOUT 20)
 
     add_test(
+        NAME integration_timeouts
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_timeouts PROPERTIES TIMEOUT 35)
+
+    add_test(
         NAME integration_protocol_and_limits
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/protection_test.py

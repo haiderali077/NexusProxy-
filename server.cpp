@@ -10,13 +10,16 @@
 #include "socket_utils.hpp"
 #include "unique_socket.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <poll.h>
 #include <span>
 #include <sys/socket.h>
@@ -26,6 +29,8 @@
 #include <vector>
 
 namespace {
+
+using namespace std::chrono_literals;
 
 using nexus::net::flushOutput;
 using nexus::net::FlushResult;
@@ -40,6 +45,7 @@ constexpr std::size_t kReadBufferSize = 16 * 1024;
 constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
 constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
 constexpr std::size_t kTunnelControlReserve = 64 * 1024;
+constexpr auto kTunnelIdleTimeout = 20s;
 
 struct PublicStream {
   UniqueSocket socket;
@@ -171,6 +177,16 @@ struct WatchedStream {
   std::size_t pollIndex{};
 };
 
+int pollTimeoutUntil(std::chrono::steady_clock::time_point deadline) {
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now());
+  if (remaining <= 0ms) {
+    return 0;
+  }
+  return static_cast<int>(std::min<std::int64_t>(
+      remaining.count(), std::numeric_limits<int>::max()));
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -212,18 +228,25 @@ int main(int argc, char *argv[]) {
   std::unordered_map<std::uint32_t, PublicStream> publicStreams;
   nexus::protocol::FrameDecoder tunnelDecoder;
   OutputQueue tunnelOutput;
+  std::optional<std::chrono::steady_clock::time_point> tunnelIdleDeadline;
   bool running = true;
 
   auto disconnectTunnel = [&] {
     tunnelSocket.reset();
     tunnelOutput.clear();
     tunnelDecoder = nexus::protocol::FrameDecoder{};
+    tunnelIdleDeadline.reset();
     closeAllPublicStreams(publicStreams);
     std::cout << "Tunnel disconnected; waiting for a developer client"
               << std::endl;
   };
 
   while (running) {
+    if (tunnelSocket && tunnelIdleDeadline &&
+        std::chrono::steady_clock::now() >= *tunnelIdleDeadline) {
+      std::cerr << "Tunnel was silent past its idle deadline" << std::endl;
+      disconnectTunnel();
+    }
     std::vector<pollfd> pollFds;
     pollFds.push_back({tunnelListener.get(), POLLIN, 0});
     const short publicListenerEvents =
@@ -255,7 +278,10 @@ int main(int argc, char *argv[]) {
 
     int ready;
     do {
-      ready = poll(pollFds.data(), pollFds.size(), -1);
+      const int timeout = tunnelIdleDeadline
+                              ? pollTimeoutUntil(*tunnelIdleDeadline)
+                              : -1;
+      ready = poll(pollFds.data(), pollFds.size(), timeout);
     } while (ready == -1 && errno == EINTR);
 
     if (ready == -1) {
@@ -284,6 +310,10 @@ int main(int argc, char *argv[]) {
           std::cerr << "Failed to make tunnel non-blocking" << std::endl;
         } else {
           tunnelSocket = std::move(accepted);
+          // Any valid tunnel traffic refreshes this deadline. Healthy clients
+          // remain connected because their PING frames arrive well before it.
+          tunnelIdleDeadline =
+              std::chrono::steady_clock::now() + kTunnelIdleTimeout;
           std::cout << "Developer tunnel connected" << std::endl;
         }
       }
@@ -349,6 +379,8 @@ int main(int argc, char *argv[]) {
           const ssize_t received =
               recv(tunnelSocket.get(), buffer, sizeof(buffer), 0);
           if (received > 0) {
+            tunnelIdleDeadline =
+                std::chrono::steady_clock::now() + kTunnelIdleTimeout;
             tunnelDecoder.append(std::span<const std::uint8_t>(
                 buffer, static_cast<std::size_t>(received)));
             if (!handleTunnelFrames(tunnelDecoder, publicStreams,

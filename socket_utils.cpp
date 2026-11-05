@@ -1,9 +1,14 @@
 #include "socket_utils.hpp"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <fcntl.h>
+#include <limits>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -14,6 +19,16 @@ void closePreservingError(int socketFd) {
     const int savedError = errno;
     close(socketFd);
     errno = savedError;
+}
+
+int remainingMilliseconds(std::chrono::steady_clock::time_point deadline) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        return 0;
+    }
+    return static_cast<int>(std::min<std::int64_t>(
+        remaining.count(), std::numeric_limits<int>::max()));
 }
 
 } // namespace
@@ -69,6 +84,72 @@ int connectTcp(const char* address, int port) {
 
     if (connect(socketFd, reinterpret_cast<sockaddr*>(&serverAddress),
                 sizeof(serverAddress)) == -1) {
+        closePreservingError(socketFd);
+        return -1;
+    }
+
+    return socketFd;
+}
+
+int connectTcp(const char* address, int port,
+               std::chrono::milliseconds timeout) {
+    const int socketFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socketFd == -1) {
+        return -1;
+    }
+
+    sockaddr_in serverAddress{};
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(port);
+    if (inet_pton(AF_INET, address, &serverAddress.sin_addr) != 1) {
+        errno = EINVAL;
+        closePreservingError(socketFd);
+        return -1;
+    }
+    if (!setNonBlocking(socketFd)) {
+        closePreservingError(socketFd);
+        return -1;
+    }
+
+    if (connect(socketFd, reinterpret_cast<sockaddr*>(&serverAddress),
+                sizeof(serverAddress)) == 0) {
+        return socketFd;
+    }
+    if (errno != EINPROGRESS) {
+        closePreservingError(socketFd);
+        return -1;
+    }
+
+    // A non-blocking connect finishes through POLLOUT. The deadline keeps an
+    // unreachable address from freezing the whole client.
+    pollfd pending{socketFd, POLLOUT, 0};
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (true) {
+        const int ready = poll(&pending, 1, remainingMilliseconds(deadline));
+        if (ready == -1 && errno == EINTR) {
+            continue;
+        }
+        if (ready == 0) {
+            errno = ETIMEDOUT;
+            closePreservingError(socketFd);
+            return -1;
+        }
+        if (ready == -1) {
+            closePreservingError(socketFd);
+            return -1;
+        }
+        break;
+    }
+
+    int connectionError = 0;
+    socklen_t errorSize = sizeof(connectionError);
+    if (getsockopt(socketFd, SOL_SOCKET, SO_ERROR, &connectionError,
+                   &errorSize) == -1) {
+        closePreservingError(socketFd);
+        return -1;
+    }
+    if (connectionError != 0) {
+        errno = connectionError;
         closePreservingError(socketFd);
         return -1;
     }
