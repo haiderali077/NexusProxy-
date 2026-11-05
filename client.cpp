@@ -5,6 +5,8 @@
 
 #include "config.hpp"
 #include "heartbeat.hpp"
+#include "limits.hpp"
+#include "logging.hpp"
 #include "protocol.hpp"
 #include "relay.hpp"
 #include "retry.hpp"
@@ -49,10 +51,6 @@ using namespace std::chrono_literals;
 
 constexpr const char *kEdgeAddress = "127.0.0.1";
 constexpr int kTunnelPort = 7000;
-constexpr std::size_t kReadBufferSize = 16 * 1024;
-constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
-constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
-constexpr std::size_t kTunnelControlReserve = 64 * 1024;
 constexpr auto kHeartbeatInterval = 5s;
 constexpr auto kPongTimeout = 15s;
 constexpr auto kConnectTimeout = 5s;
@@ -65,30 +63,34 @@ struct LocalStream {
 
 bool tunnelCanAcceptData(const OutputQueue &output) {
   constexpr std::size_t required = nexus::protocol::kFrameHeaderSize +
-                                   kReadBufferSize + kTunnelControlReserve;
-  return output.canAppend(required, kMaxTunnelQueueBytes);
+                                   nexus::limits::kReadBufferBytes +
+                                   nexus::limits::kTunnelControlReserveBytes;
+  return output.canAppend(required, nexus::limits::kMaxTunnelQueueBytes);
 }
 
 bool queueClose(OutputQueue &tunnelOutput, std::uint32_t streamId) {
   return queueFrame(tunnelOutput,
                     {nexus::protocol::MessageType::Close, streamId, {}},
-                    kMaxTunnelQueueBytes);
+                    nexus::limits::kMaxTunnelQueueBytes);
 }
 
 void removeLocalStream(std::unordered_map<std::uint32_t, LocalStream> &streams,
-                       std::uint32_t streamId) {
+                       std::uint32_t streamId, std::uint64_t tunnelId) {
   const auto stream = streams.find(streamId);
   if (stream == streams.end()) {
     return;
   }
   streams.erase(stream);
-  std::cout << "Closed local stream " << streamId << std::endl;
+  nexus::logging::writeEvent(std::cout, "client", tunnelId, streamId,
+                             "closed local stream");
 }
 
 void closeAllLocalStreams(
-    std::unordered_map<std::uint32_t, LocalStream> &streams) {
+    std::unordered_map<std::uint32_t, LocalStream> &streams,
+    std::uint64_t tunnelId) {
   for (const auto &entry : streams) {
-    std::cout << "Closed local stream " << entry.first << std::endl;
+    nexus::logging::writeEvent(std::cout, "client", tunnelId, entry.first,
+                               "closed local stream");
   }
   streams.clear();
 }
@@ -98,7 +100,8 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
                         OutputQueue &tunnelOutput, const char *localAddress,
                         int localPort,
                         std::optional<std::uint64_t> &awaitedPong,
-                        std::chrono::steady_clock::time_point &nextHeartbeat) {
+                        std::chrono::steady_clock::time_point &nextHeartbeat,
+                        std::uint64_t tunnelId) {
   while (true) {
     nexus::protocol::Frame frame;
     const auto status = decoder.nextFrame(frame);
@@ -130,6 +133,13 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
                   << std::endl;
         return false;
       }
+      if (streams.size() >= nexus::limits::kMaxStreamsPerTunnel) {
+        nexus::logging::writeEvent(std::cerr, "client", tunnelId,
+                                   frame.streamId,
+                                   "rejected stream at the active limit");
+        queueClose(tunnelOutput, frame.streamId);
+        continue;
+      }
 
       UniqueSocket localSocket{
           connectTcp(localAddress, localPort, kConnectTimeout)};
@@ -148,7 +158,8 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
 
       streams.emplace(frame.streamId,
                       LocalStream{std::move(localSocket), {}, false});
-      std::cout << "Opened local stream " << frame.streamId << std::endl;
+      nexus::logging::writeEvent(std::cout, "client", tunnelId,
+                                 frame.streamId, "opened local stream");
       continue;
     }
 
@@ -161,17 +172,18 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
     }
 
     if (frame.type == nexus::protocol::MessageType::Data) {
-      if (!stream->second.output.append(frame.payload, kMaxStreamQueueBytes)) {
+      if (!stream->second.output.append(
+              frame.payload, nexus::limits::kMaxStreamQueueBytes)) {
         std::cerr << "Local stream " << frame.streamId
                   << " exceeded its output limit" << std::endl;
         queueClose(tunnelOutput, frame.streamId);
-        removeLocalStream(streams, frame.streamId);
+        removeLocalStream(streams, frame.streamId, tunnelId);
       }
       continue;
     }
     if (frame.type == nexus::protocol::MessageType::Close) {
       if (stream->second.output.empty()) {
-        removeLocalStream(streams, frame.streamId);
+        removeLocalStream(streams, frame.streamId, tunnelId);
       } else {
         stream->second.closeAfterFlush = true;
       }
@@ -250,6 +262,7 @@ int main(int argc, char *argv[]) {
   }
 
   ReconnectBackoff reconnectBackoff{250ms, 10s};
+  std::uint64_t nextTunnelId = 1;
 
   // Every pass owns one complete tunnel session. Returning here after a
   // disconnect would make a temporary network problem stop the client.
@@ -270,8 +283,10 @@ int main(int argc, char *argv[]) {
 
     // A successful connection resets the penalty from earlier failures.
     reconnectBackoff.reset();
-    std::cout << "Connected to edge; exposing " << localAddress << ':'
-              << localPort << std::endl;
+    const std::uint64_t tunnelId = nextTunnelId++;
+    nexus::logging::writeEvent(std::cout, "client", tunnelId, std::nullopt,
+                               "connected to edge");
+    std::cout << "Exposing " << localAddress << ':' << localPort << std::endl;
 
     // Decoder bytes, output bytes, and local sockets belong to this tunnel
     // only. Recreating them prevents stale state entering the next session.
@@ -298,7 +313,8 @@ int main(int argc, char *argv[]) {
         const nexus::protocol::Frame ping{
             nexus::protocol::MessageType::Ping, 0,
             nexus::reliability::encodeHeartbeatToken(token)};
-        if (!queueFrame(tunnelOutput, ping, kMaxTunnelQueueBytes)) {
+        if (!queueFrame(tunnelOutput, ping,
+                        nexus::limits::kMaxTunnelQueueBytes)) {
           std::cerr << "Could not queue PING; tunnel output is full"
                     << std::endl;
           relaySucceeded = false;
@@ -358,7 +374,7 @@ int main(int argc, char *argv[]) {
       }
 
       if (tunnelReady & (POLLIN | POLLHUP)) {
-        std::uint8_t buffer[kReadBufferSize];
+        std::uint8_t buffer[nexus::limits::kReadBufferBytes];
         while (true) {
           const ssize_t received =
               recv(tunnelSocket.get(), buffer, sizeof(buffer), 0);
@@ -367,7 +383,7 @@ int main(int argc, char *argv[]) {
                 buffer, static_cast<std::size_t>(received)));
             if (!handleTunnelFrames(tunnelDecoder, localStreams, tunnelOutput,
                                     localAddress, localPort, awaitedPong,
-                                    nextHeartbeat)) {
+                                    nextHeartbeat, tunnelId)) {
               relaySucceeded = false;
               sessionRunning = false;
               break;
@@ -411,11 +427,11 @@ int main(int argc, char *argv[]) {
               flushOutput(stream->second.socket.get(), stream->second.output);
           if (result != FlushResult::Ready) {
             queueClose(tunnelOutput, watched.streamId);
-            removeLocalStream(localStreams, watched.streamId);
+            removeLocalStream(localStreams, watched.streamId, tunnelId);
             continue;
           }
           if (stream->second.closeAfterFlush && stream->second.output.empty()) {
-            removeLocalStream(localStreams, watched.streamId);
+            removeLocalStream(localStreams, watched.streamId, tunnelId);
             continue;
           }
         }
@@ -426,7 +442,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (events & (POLLIN | POLLHUP)) {
-          std::uint8_t buffer[kReadBufferSize];
+          std::uint8_t buffer[nexus::limits::kReadBufferBytes];
           bool streamFinished = false;
           while (!streamFinished) {
             if (!tunnelCanAcceptData(tunnelOutput)) {
@@ -439,7 +455,8 @@ int main(int argc, char *argv[]) {
                   nexus::protocol::MessageType::Data,
                   watched.streamId,
                   {buffer, buffer + received}};
-              if (!queueFrame(tunnelOutput, dataFrame, kMaxTunnelQueueBytes)) {
+              if (!queueFrame(tunnelOutput, dataFrame,
+                              nexus::limits::kMaxTunnelQueueBytes)) {
                 std::cerr << "Failed to encode DATA for stream "
                           << watched.streamId << std::endl;
                 relaySucceeded = false;
@@ -450,7 +467,7 @@ int main(int argc, char *argv[]) {
             }
             if (received == 0) {
               queueClose(tunnelOutput, watched.streamId);
-              removeLocalStream(localStreams, watched.streamId);
+              removeLocalStream(localStreams, watched.streamId, tunnelId);
               streamFinished = true;
               continue;
             }
@@ -464,7 +481,7 @@ int main(int argc, char *argv[]) {
             std::cerr << "Local recv() failed for stream " << watched.streamId
                       << ": " << std::strerror(errno) << std::endl;
             queueClose(tunnelOutput, watched.streamId);
-            removeLocalStream(localStreams, watched.streamId);
+            removeLocalStream(localStreams, watched.streamId, tunnelId);
             streamFinished = true;
           }
         }
@@ -472,7 +489,7 @@ int main(int argc, char *argv[]) {
         if (localStreams.contains(watched.streamId) &&
             (events & (POLLERR | POLLNVAL))) {
           queueClose(tunnelOutput, watched.streamId);
-          removeLocalStream(localStreams, watched.streamId);
+          removeLocalStream(localStreams, watched.streamId, tunnelId);
         }
       }
     }
@@ -485,11 +502,11 @@ int main(int argc, char *argv[]) {
         queueClose(tunnelOutput, streamId);
       }
       drainOutput(tunnelSocket.get(), tunnelOutput, 1s);
-      closeAllLocalStreams(localStreams);
+      closeAllLocalStreams(localStreams, tunnelId);
       break;
     }
 
-    closeAllLocalStreams(localStreams);
+    closeAllLocalStreams(localStreams, tunnelId);
     waitBeforeReconnect(reconnectBackoff, relaySucceeded
                                               ? "Tunnel disconnected"
                                               : "Tunnel session failed");

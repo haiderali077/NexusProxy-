@@ -53,6 +53,7 @@ target_link_libraries(nexus_protocol PRIVATE
 add_library(nexus_runtime STATIC
     config.cpp
     heartbeat.cpp
+    logging.cpp
     relay.cpp
     retry.cpp
     shutdown.cpp
@@ -211,6 +212,15 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:nexus-client>
     )
     set_tests_properties(integration_graceful_shutdown PROPERTIES TIMEOUT 20)
+
+    add_test(
+        NAME integration_logging_and_limits
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/logging_and_limits_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_logging_and_limits PROPERTIES TIMEOUT 30)
 
     add_test(
         NAME integration_protocol_and_limits

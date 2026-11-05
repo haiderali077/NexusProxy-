@@ -5,6 +5,8 @@
 
 #include "config.hpp"
 #include "heartbeat.hpp"
+#include "limits.hpp"
+#include "logging.hpp"
 #include "protocol.hpp"
 #include "relay.hpp"
 #include "shutdown.hpp"
@@ -43,11 +45,9 @@ using nexus::net::UniqueSocket;
 
 constexpr int kTunnelPort = 7000;
 constexpr int kPublicPort = 8000;
-constexpr std::size_t kReadBufferSize = 16 * 1024;
-constexpr std::size_t kMaxStreamQueueBytes = 256 * 1024;
-constexpr std::size_t kMaxTunnelQueueBytes = 4 * 1024 * 1024;
-constexpr std::size_t kTunnelControlReserve = 64 * 1024;
 constexpr auto kTunnelIdleTimeout = 20s;
+static_assert(nexus::limits::kMaxConcurrentTunnels == 1,
+              "the current edge owns one active tunnel");
 
 struct PublicStream {
   UniqueSocket socket;
@@ -61,25 +61,29 @@ struct PublicStream {
 // false, poll() temporarily stops requesting reads from public sockets.
 bool tunnelCanAcceptData(const OutputQueue &output) {
   constexpr std::size_t required = nexus::protocol::kFrameHeaderSize +
-                                   kReadBufferSize + kTunnelControlReserve;
-  return output.canAppend(required, kMaxTunnelQueueBytes);
+                                   nexus::limits::kReadBufferBytes +
+                                   nexus::limits::kTunnelControlReserveBytes;
+  return output.canAppend(required, nexus::limits::kMaxTunnelQueueBytes);
 }
 
 void removePublicStream(
     std::unordered_map<std::uint32_t, PublicStream> &streams,
-    std::uint32_t streamId) {
+    std::uint32_t streamId, std::uint64_t tunnelId) {
   const auto stream = streams.find(streamId);
   if (stream == streams.end()) {
     return;
   }
   streams.erase(stream);
-  std::cout << "Closed public stream " << streamId << std::endl;
+  nexus::logging::writeEvent(std::cout, "edge", tunnelId, streamId,
+                             "closed public stream");
 }
 
 void closeAllPublicStreams(
-    std::unordered_map<std::uint32_t, PublicStream> &streams) {
+    std::unordered_map<std::uint32_t, PublicStream> &streams,
+    std::uint64_t tunnelId) {
   for (const auto &entry : streams) {
-    std::cout << "Closed public stream " << entry.first << std::endl;
+    nexus::logging::writeEvent(std::cout, "edge", tunnelId, entry.first,
+                               "closed public stream");
   }
   streams.clear();
 }
@@ -105,22 +109,23 @@ std::uint32_t allocateStreamId(
 bool queueClose(OutputQueue &tunnelOutput, std::uint32_t streamId) {
   return queueFrame(tunnelOutput,
                     {nexus::protocol::MessageType::Close, streamId, {}},
-                    kMaxTunnelQueueBytes);
+                    nexus::limits::kMaxTunnelQueueBytes);
 }
 
 void finishPublicStream(
     std::unordered_map<std::uint32_t, PublicStream> &streams,
-    OutputQueue &tunnelOutput, std::uint32_t streamId, bool notifyClient) {
+    OutputQueue &tunnelOutput, std::uint32_t streamId, bool notifyClient,
+    std::uint64_t tunnelId) {
   if (notifyClient && !queueClose(tunnelOutput, streamId)) {
     std::cerr << "Failed to encode CLOSE for stream " << streamId << std::endl;
   }
-  removePublicStream(streams, streamId);
+  removePublicStream(streams, streamId, tunnelId);
 }
 
 bool handleTunnelFrames(
     nexus::protocol::FrameDecoder &decoder,
     std::unordered_map<std::uint32_t, PublicStream> &streams,
-    OutputQueue &tunnelOutput) {
+    OutputQueue &tunnelOutput, std::uint64_t tunnelId) {
   while (true) {
     nexus::protocol::Frame frame;
     const auto status = decoder.nextFrame(frame);
@@ -136,7 +141,8 @@ bool handleTunnelFrames(
       // Echoing the token lets the client match this PONG to its PING.
       const nexus::protocol::Frame pong{nexus::protocol::MessageType::Pong, 0,
                                         frame.payload};
-      if (!queueFrame(tunnelOutput, pong, kMaxTunnelQueueBytes)) {
+      if (!queueFrame(tunnelOutput, pong,
+                      nexus::limits::kMaxTunnelQueueBytes)) {
         std::cerr << "Could not queue PONG; tunnel output is full" << std::endl;
         return false;
       }
@@ -152,17 +158,18 @@ bool handleTunnelFrames(
     }
 
     if (frame.type == nexus::protocol::MessageType::Data) {
-      if (!stream->second.output.append(frame.payload, kMaxStreamQueueBytes)) {
+      if (!stream->second.output.append(
+              frame.payload, nexus::limits::kMaxStreamQueueBytes)) {
         std::cerr << "Public stream " << frame.streamId
                   << " exceeded its output limit" << std::endl;
         queueClose(tunnelOutput, frame.streamId);
-        removePublicStream(streams, frame.streamId);
+        removePublicStream(streams, frame.streamId, tunnelId);
       }
       continue;
     }
     if (frame.type == nexus::protocol::MessageType::Close) {
       if (stream->second.output.empty()) {
-        removePublicStream(streams, frame.streamId);
+        removePublicStream(streams, frame.streamId, tunnelId);
       } else {
         stream->second.closeAfterFlush = true;
       }
@@ -235,16 +242,21 @@ int main(int argc, char *argv[]) {
   nexus::protocol::FrameDecoder tunnelDecoder;
   OutputQueue tunnelOutput;
   std::optional<std::chrono::steady_clock::time_point> tunnelIdleDeadline;
+  std::uint64_t nextTunnelId = 1;
+  std::uint64_t activeTunnelId = 0;
   bool running = true;
 
   auto disconnectTunnel = [&] {
+    if (tunnelSocket) {
+      nexus::logging::writeEvent(std::cout, "edge", activeTunnelId,
+                                 std::nullopt, "tunnel disconnected");
+    }
     tunnelSocket.reset();
     tunnelOutput.clear();
     tunnelDecoder = nexus::protocol::FrameDecoder{};
     tunnelIdleDeadline.reset();
-    closeAllPublicStreams(publicStreams);
-    std::cout << "Tunnel disconnected; waiting for a developer client"
-              << std::endl;
+    closeAllPublicStreams(publicStreams, activeTunnelId);
+    activeTunnelId = 0;
   };
 
   while (running && !nexus::process::shutdownRequested()) {
@@ -316,17 +328,20 @@ int main(int argc, char *argv[]) {
         }
 
         if (tunnelSocket) {
-          std::cerr << "A tunnel is already connected; rejecting another"
-                    << std::endl;
+          nexus::logging::writeEvent(
+              std::cerr, "edge", activeTunnelId, std::nullopt,
+              "rejected another tunnel at the active limit");
         } else if (!setNonBlocking(accepted.get())) {
           std::cerr << "Failed to make tunnel non-blocking" << std::endl;
         } else {
           tunnelSocket = std::move(accepted);
+          activeTunnelId = nextTunnelId++;
           // Any valid tunnel traffic refreshes this deadline. Healthy clients
           // remain connected because their PING frames arrive well before it.
           tunnelIdleDeadline =
               std::chrono::steady_clock::now() + kTunnelIdleTimeout;
-          std::cout << "Developer tunnel connected" << std::endl;
+          nexus::logging::writeEvent(std::cout, "edge", activeTunnelId,
+                                     std::nullopt, "developer tunnel connected");
         }
       }
     }
@@ -354,6 +369,12 @@ int main(int argc, char *argv[]) {
           std::cerr << "Failed to make public socket non-blocking" << std::endl;
           continue;
         }
+        if (publicStreams.size() >= nexus::limits::kMaxStreamsPerTunnel) {
+          nexus::logging::writeEvent(
+              std::cerr, "edge", activeTunnelId, std::nullopt,
+              "rejected public connection at the stream limit");
+          continue;
+        }
 
         const std::uint32_t streamId =
             allocateStreamId(nextStreamId, publicStreams);
@@ -366,11 +387,12 @@ int main(int argc, char *argv[]) {
                               PublicStream{std::move(accepted), {}, false});
         if (!queueFrame(tunnelOutput,
                         {nexus::protocol::MessageType::Open, streamId, {}},
-                        kMaxTunnelQueueBytes)) {
-          removePublicStream(publicStreams, streamId);
+                        nexus::limits::kMaxTunnelQueueBytes)) {
+          removePublicStream(publicStreams, streamId, activeTunnelId);
           continue;
         }
-        std::cout << "Opened public stream " << streamId << std::endl;
+        nexus::logging::writeEvent(std::cout, "edge", activeTunnelId,
+                                   streamId, "opened public stream");
       }
     }
 
@@ -386,7 +408,7 @@ int main(int argc, char *argv[]) {
       }
 
       if (tunnelSocket && (events & (POLLIN | POLLHUP))) {
-        std::uint8_t buffer[kReadBufferSize];
+        std::uint8_t buffer[nexus::limits::kReadBufferBytes];
         while (true) {
           const ssize_t received =
               recv(tunnelSocket.get(), buffer, sizeof(buffer), 0);
@@ -395,8 +417,8 @@ int main(int argc, char *argv[]) {
                 std::chrono::steady_clock::now() + kTunnelIdleTimeout;
             tunnelDecoder.append(std::span<const std::uint8_t>(
                 buffer, static_cast<std::size_t>(received)));
-            if (!handleTunnelFrames(tunnelDecoder, publicStreams,
-                                    tunnelOutput)) {
+            if (!handleTunnelFrames(tunnelDecoder, publicStreams, tunnelOutput,
+                                    activeTunnelId)) {
               disconnectTunnel();
               break;
             }
@@ -436,11 +458,11 @@ int main(int argc, char *argv[]) {
             flushOutput(stream->second.socket.get(), stream->second.output);
         if (result != FlushResult::Ready) {
           finishPublicStream(publicStreams, tunnelOutput, watched.streamId,
-                             static_cast<bool>(tunnelSocket));
+                             static_cast<bool>(tunnelSocket), activeTunnelId);
           continue;
         }
         if (stream->second.closeAfterFlush && stream->second.output.empty()) {
-          removePublicStream(publicStreams, watched.streamId);
+          removePublicStream(publicStreams, watched.streamId, activeTunnelId);
           continue;
         }
       }
@@ -451,7 +473,7 @@ int main(int argc, char *argv[]) {
       }
 
       if (events & (POLLIN | POLLHUP)) {
-        std::uint8_t buffer[kReadBufferSize];
+        std::uint8_t buffer[nexus::limits::kReadBufferBytes];
         bool streamFinished = false;
         while (!streamFinished) {
           if (!tunnelCanAcceptData(tunnelOutput)) {
@@ -464,7 +486,8 @@ int main(int argc, char *argv[]) {
                 nexus::protocol::MessageType::Data,
                 watched.streamId,
                 {buffer, buffer + received}};
-            if (!queueFrame(tunnelOutput, dataFrame, kMaxTunnelQueueBytes)) {
+            if (!queueFrame(tunnelOutput, dataFrame,
+                            nexus::limits::kMaxTunnelQueueBytes)) {
               std::cerr << "Failed to encode DATA for stream "
                         << watched.streamId << std::endl;
               running = false;
@@ -474,7 +497,7 @@ int main(int argc, char *argv[]) {
           }
           if (received == 0) {
             finishPublicStream(publicStreams, tunnelOutput, watched.streamId,
-                               static_cast<bool>(tunnelSocket));
+                               static_cast<bool>(tunnelSocket), activeTunnelId);
             streamFinished = true;
             continue;
           }
@@ -488,7 +511,7 @@ int main(int argc, char *argv[]) {
           std::cerr << "Public recv() failed for stream " << watched.streamId
                     << ": " << std::strerror(errno) << std::endl;
           finishPublicStream(publicStreams, tunnelOutput, watched.streamId,
-                             static_cast<bool>(tunnelSocket));
+                             static_cast<bool>(tunnelSocket), activeTunnelId);
           streamFinished = true;
         }
       }
@@ -496,7 +519,7 @@ int main(int argc, char *argv[]) {
       if (publicStreams.contains(watched.streamId) &&
           (events & (POLLERR | POLLNVAL))) {
         finishPublicStream(publicStreams, tunnelOutput, watched.streamId,
-                           static_cast<bool>(tunnelSocket));
+                           static_cast<bool>(tunnelSocket), activeTunnelId);
       }
     }
   }
@@ -510,7 +533,7 @@ int main(int argc, char *argv[]) {
     // peer is stalled. A shutdown path must have its own deadline too.
     drainOutput(tunnelSocket.get(), tunnelOutput, 1s);
   }
-  closeAllPublicStreams(publicStreams);
+  closeAllPublicStreams(publicStreams, activeTunnelId);
   if (nexus::process::shutdownRequested()) {
     std::cout << "Edge shutdown complete" << std::endl;
   }
