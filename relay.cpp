@@ -1,6 +1,10 @@
 #include "relay.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <limits>
+#include <poll.h>
 #include <sys/socket.h>
 
 namespace nexus::net {
@@ -76,6 +80,37 @@ FlushResult flushOutput(int socketFd, OutputQueue& output) {
         return FlushResult::Error;
     }
     return FlushResult::Ready;
+}
+
+bool drainOutput(int socketFd, OutputQueue& output,
+                 std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!output.empty()) {
+        if (flushOutput(socketFd, output) != FlushResult::Ready) {
+            return false;
+        }
+        if (output.empty()) {
+            return true;
+        }
+
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+        if (remaining <= std::chrono::milliseconds::zero()) {
+            return false;
+        }
+        const int waitMilliseconds = static_cast<int>(std::min<std::int64_t>(
+            remaining.count(), std::numeric_limits<int>::max()));
+        pollfd writable{socketFd, POLLOUT, 0};
+        const int ready = poll(&writable, 1, waitMilliseconds);
+        if (ready == -1 && errno == EINTR) {
+            continue;
+        }
+        if (ready <= 0 || (writable.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace nexus::net

@@ -52,7 +52,11 @@ target_link_libraries(nexus_protocol PRIVATE
 
 add_library(nexus_runtime STATIC
     config.cpp
+    heartbeat.cpp
+    logging.cpp
     relay.cpp
+    retry.cpp
+    shutdown.cpp
     socket_utils.cpp
     unique_socket.cpp
 )
@@ -116,6 +120,36 @@ if(BUILD_TESTING)
     )
     add_test(NAME relay_tests COMMAND relay_tests)
 
+    add_executable(retry_tests
+        retry_tests.cpp
+    )
+    target_link_libraries(retry_tests PRIVATE
+        nexus_runtime
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(NAME retry_tests COMMAND retry_tests)
+
+    add_executable(heartbeat_tests
+        heartbeat_tests.cpp
+    )
+    target_link_libraries(heartbeat_tests PRIVATE
+        nexus_runtime
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(NAME heartbeat_tests COMMAND heartbeat_tests)
+
+    add_executable(shutdown_tests
+        shutdown_tests.cpp
+    )
+    target_link_libraries(shutdown_tests PRIVATE
+        nexus_runtime
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(NAME shutdown_tests COMMAND shutdown_tests)
+
     add_test(
         NAME integration_single_request
         COMMAND ${Python3_EXECUTABLE}
@@ -142,6 +176,51 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:nexus-client>
     )
     set_tests_properties(integration_disconnect_reconnect PROPERTIES TIMEOUT 30)
+
+    add_test(
+        NAME integration_automatic_reconnect
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/automatic_reconnect_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_automatic_reconnect PROPERTIES TIMEOUT 30)
+
+    add_test(
+        NAME integration_heartbeat
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/heartbeat_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_heartbeat PROPERTIES TIMEOUT 20)
+
+    add_test(
+        NAME integration_timeouts
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_timeouts PROPERTIES TIMEOUT 35)
+
+    add_test(
+        NAME integration_graceful_shutdown
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/shutdown_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_graceful_shutdown PROPERTIES TIMEOUT 20)
+
+    add_test(
+        NAME integration_logging_and_limits
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/logging_and_limits_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_logging_and_limits PROPERTIES TIMEOUT 30)
 
     add_test(
         NAME integration_protocol_and_limits
