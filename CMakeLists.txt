@@ -4,6 +4,8 @@ project(NexusProxy VERSION 0.1.0 LANGUAGES CXX)
 
 include(CTest)
 
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS SSL Crypto)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -50,6 +52,21 @@ target_link_libraries(nexus_protocol PRIVATE
     nexus_sanitizers
 )
 
+add_library(nexus_security STATIC
+    tls_error.cpp
+)
+target_include_directories(nexus_security PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(nexus_security PUBLIC
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+target_link_libraries(nexus_security PRIVATE
+    nexus_warnings
+    nexus_sanitizers
+)
+
 add_library(nexus_runtime STATIC
     config.cpp
     heartbeat.cpp
@@ -63,7 +80,7 @@ add_library(nexus_runtime STATIC
 target_include_directories(nexus_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(nexus_runtime PUBLIC nexus_protocol)
+target_link_libraries(nexus_runtime PUBLIC nexus_protocol nexus_security)
 target_link_libraries(nexus_runtime PRIVATE
     nexus_warnings
     nexus_sanitizers
