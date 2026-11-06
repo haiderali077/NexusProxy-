@@ -53,6 +53,7 @@ target_link_libraries(nexus_protocol PRIVATE
 )
 
 add_library(nexus_security STATIC
+    tls_connection.cpp
     tls_context.cpp
     tls_error.cpp
 )
