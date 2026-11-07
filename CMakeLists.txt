@@ -77,6 +77,7 @@ add_library(nexus_runtime STATIC
     retry.cpp
     shutdown.cpp
     socket_utils.cpp
+    tls_transport.cpp
     unique_socket.cpp
 )
 target_include_directories(nexus_runtime PUBLIC
