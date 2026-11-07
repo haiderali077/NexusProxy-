@@ -33,6 +33,8 @@ Testing/
 *.gcno
 *.profraw
 *.profdata
+__pycache__/
+*.py[cod]
 
 # Local logs and environment overrides
 *.log

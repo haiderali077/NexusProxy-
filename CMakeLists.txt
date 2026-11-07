@@ -170,6 +170,21 @@ if(BUILD_TESTING)
     )
     add_test(NAME shutdown_tests COMMAND shutdown_tests)
 
+    add_executable(tls_context_tests
+        tls_context_tests.cpp
+    )
+    target_link_libraries(tls_context_tests PRIVATE
+        nexus_security
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(
+        NAME tls_context_tests
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_context_test.py
+                $<TARGET_FILE:tls_context_tests>
+    )
+
     add_test(
         NAME integration_single_request
         COMMAND ${Python3_EXECUTABLE}
