@@ -12,6 +12,9 @@
 #include "retry.hpp"
 #include "shutdown.hpp"
 #include "socket_utils.hpp"
+#include "tls_connection.hpp"
+#include "tls_context.hpp"
+#include "tls_transport.hpp"
 #include "unique_socket.hpp"
 
 #include <algorithm>
@@ -20,6 +23,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -38,7 +42,8 @@
 namespace {
 
 using nexus::net::connectTcp;
-using nexus::net::drainOutput;
+using nexus::net::drainTlsOutput;
+using nexus::net::flushTlsOutput;
 using nexus::net::flushOutput;
 using nexus::net::FlushResult;
 using nexus::net::OutputQueue;
@@ -54,6 +59,7 @@ constexpr int kTunnelPort = 7000;
 constexpr auto kHeartbeatInterval = 5s;
 constexpr auto kPongTimeout = 15s;
 constexpr auto kConnectTimeout = 5s;
+constexpr auto kTlsHandshakeTimeout = 5s;
 
 struct LocalStream {
   UniqueSocket socket;
@@ -261,6 +267,25 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  const char *trustedCaFile = std::getenv("NEXUS_TLS_CA_FILE");
+  const char *configuredServerName = std::getenv("NEXUS_TLS_SERVER_NAME");
+  if (trustedCaFile == nullptr || *trustedCaFile == '\0') {
+    std::cerr << "NEXUS_TLS_CA_FILE must name the trusted CA certificate"
+              << std::endl;
+    return 1;
+  }
+  const std::string expectedServerName =
+      configuredServerName == nullptr || *configuredServerName == '\0'
+          ? edgeAddress
+          : configuredServerName;
+  std::string tlsError;
+  auto tlsContext = nexus::security::TlsContext::createClient(trustedCaFile,
+                                                               tlsError);
+  if (!tlsContext) {
+    std::cerr << "Failed to configure client TLS: " << tlsError << std::endl;
+    return 1;
+  }
+
   ReconnectBackoff reconnectBackoff{250ms, 10s};
   std::uint64_t nextTunnelId = 1;
 
@@ -281,7 +306,20 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    // A successful connection resets the penalty from earlier failures.
+    tlsError.clear();
+    auto tunnelTls = nexus::security::TlsConnection::createClient(
+        *tlsContext, tunnelSocket.get(), expectedServerName, tlsError);
+    if (!tunnelTls || !nexus::net::performTlsHandshake(
+                          tunnelSocket.get(), *tunnelTls,
+                          kTlsHandshakeTimeout, tlsError) ||
+        !tunnelTls->peerCertificateVerified()) {
+      std::cerr << "TLS connection to the edge failed: " << tlsError
+                << std::endl;
+      waitBeforeReconnect(reconnectBackoff, "Secure tunnel setup failed");
+      continue;
+    }
+
+    // Reset backoff only after encryption and identity verification succeed.
     reconnectBackoff.reset();
     const std::uint64_t tunnelId = nextTunnelId++;
     nexus::logging::writeEvent(std::cout, "client", tunnelId, std::nullopt,
@@ -299,6 +337,8 @@ int main(int argc, char *argv[]) {
     std::optional<std::uint64_t> awaitedPong;
     auto nextHeartbeat = std::chrono::steady_clock::now();
     auto pongDeadline = nextHeartbeat;
+    bool tlsReadWantsWrite = false;
+    bool tlsWriteWantsRead = false;
 
     while (sessionRunning && !nexus::process::shutdownRequested()) {
       const auto now = std::chrono::steady_clock::now();
@@ -326,7 +366,7 @@ int main(int argc, char *argv[]) {
 
       std::vector<pollfd> pollFds;
       short tunnelEvents = POLLIN;
-      if (!tunnelOutput.empty()) {
+      if (!tunnelOutput.empty() || tlsReadWantsWrite) {
         tunnelEvents |= POLLOUT;
       }
       pollFds.push_back({tunnelSocket.get(), tunnelEvents, 0});
@@ -364,23 +404,34 @@ int main(int argc, char *argv[]) {
       }
 
       const short tunnelReady = pollFds[0].revents;
-      if (tunnelReady & POLLOUT) {
-        if (flushOutput(tunnelSocket.get(), tunnelOutput) !=
-            FlushResult::Ready) {
-          std::cerr << "Failed to flush tunnel output" << std::endl;
+      if (!tunnelOutput.empty() &&
+          ((tunnelReady & POLLOUT) ||
+           (tlsWriteWantsRead && (tunnelReady & POLLIN)))) {
+        tlsError.clear();
+        const auto status = flushTlsOutput(*tunnelTls, tunnelOutput, tlsError);
+        tlsWriteWantsRead =
+            status == nexus::security::TlsStatus::WantRead;
+        if (status != nexus::security::TlsStatus::Complete &&
+            status != nexus::security::TlsStatus::WantRead &&
+            status != nexus::security::TlsStatus::WantWrite) {
+          std::cerr << "Failed to flush encrypted tunnel output: " << tlsError
+                    << std::endl;
           relaySucceeded = false;
           break;
         }
       }
 
-      if (tunnelReady & (POLLIN | POLLHUP)) {
+      if ((tunnelReady & (POLLIN | POLLHUP)) ||
+          (tlsReadWantsWrite && (tunnelReady & POLLOUT))) {
         std::uint8_t buffer[nexus::limits::kReadBufferBytes];
         while (true) {
-          const ssize_t received =
-              recv(tunnelSocket.get(), buffer, sizeof(buffer), 0);
-          if (received > 0) {
+          tlsError.clear();
+          const auto result = tunnelTls->read(buffer, tlsError);
+          if (result.status == nexus::security::TlsStatus::Complete &&
+              result.bytes > 0) {
+            tlsReadWantsWrite = false;
             tunnelDecoder.append(std::span<const std::uint8_t>(
-                buffer, static_cast<std::size_t>(received)));
+                buffer, result.bytes));
             if (!handleTunnelFrames(tunnelDecoder, localStreams, tunnelOutput,
                                     localAddress, localPort, awaitedPong,
                                     nextHeartbeat, tunnelId)) {
@@ -390,18 +441,20 @@ int main(int argc, char *argv[]) {
             }
             continue;
           }
-          if (received == 0) {
+          if (result.status == nexus::security::TlsStatus::WantRead) {
+            tlsReadWantsWrite = false;
+            break;
+          }
+          if (result.status == nexus::security::TlsStatus::WantWrite) {
+            tlsReadWantsWrite = true;
+            break;
+          }
+          if (result.status == nexus::security::TlsStatus::Closed) {
             std::cout << "Edge closed the tunnel" << std::endl;
             sessionRunning = false;
             break;
           }
-          if (errno == EINTR) {
-            continue;
-          }
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-          }
-          std::cerr << "Tunnel recv() failed: " << std::strerror(errno)
+          std::cerr << "Encrypted tunnel read failed: " << tlsError
                     << std::endl;
           relaySucceeded = false;
           sessionRunning = false;
@@ -501,7 +554,10 @@ int main(int argc, char *argv[]) {
         static_cast<void>(stream);
         queueClose(tunnelOutput, streamId);
       }
-      drainOutput(tunnelSocket.get(), tunnelOutput, 1s);
+      tlsError.clear();
+      drainTlsOutput(tunnelSocket.get(), *tunnelTls, tunnelOutput, 1s,
+                     tlsError);
+      tunnelTls->shutdown();
       closeAllLocalStreams(localStreams, tunnelId);
       break;
     }

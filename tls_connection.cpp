@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -103,7 +105,8 @@ std::optional<TlsConnection> TlsConnection::createClient(
 
 TlsStatus TlsConnection::handshake(std::string& error) {
     ERR_clear_error();
-    return translateResult(SSL_do_handshake(connection_), error);
+    const int result = SSL_do_handshake(connection_);
+    return result == 1 ? TlsStatus::Complete : translateResult(result, error);
 }
 
 TlsIoResult TlsConnection::read(std::span<std::uint8_t> output,
@@ -176,9 +179,15 @@ TlsStatus TlsConnection::translateResult(int result, std::string& error) const {
             if (result == 0) {
                 return TlsStatus::Closed;
             }
+            if (errno != 0) {
+                error = std::string{"TLS socket operation failed: "} +
+                        std::strerror(errno);
+                return TlsStatus::Error;
+            }
             [[fallthrough]];
         default:
-            error = collectOpenSslErrors();
+            error = "OpenSSL TLS error " + std::to_string(sslError) + ": " +
+                    collectOpenSslErrors();
             return TlsStatus::Error;
     }
 }

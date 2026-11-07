@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 
+from security_test_support import tls_client_when_ready, tls_server_connection
+
 
 HEADER_FORMAT = "!BBHII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -68,7 +70,7 @@ def test_edge_answers_ping(edge_path):
     try:
         time.sleep(0.2)
         token = b"12345678"
-        with socket.create_connection(("127.0.0.1", tunnel_port), timeout=2) as tunnel:
+        with tls_client_when_ready("127.0.0.1", tunnel_port) as tunnel:
             tunnel.settimeout(3)
             tunnel.sendall(encode_frame(PING, token))
             version, message_type, flags, stream_id, payload = receive_frame(tunnel)
@@ -94,8 +96,8 @@ def test_client_sends_ping(client_path):
         )
         try:
             listener.settimeout(3)
-            tunnel, _ = listener.accept()
-            with tunnel:
+            raw_tunnel, _ = listener.accept()
+            with tls_server_connection(raw_tunnel) as tunnel:
                 tunnel.settimeout(7)
                 version, message_type, flags, stream_id, payload = receive_frame(tunnel)
                 if (version, message_type, flags, stream_id, len(payload)) != (

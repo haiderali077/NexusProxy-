@@ -1,7 +1,10 @@
 import os
 from pathlib import Path
+import socket
+import ssl
 import subprocess
 import tempfile
+import time
 
 
 class TestCertificate:
@@ -61,3 +64,38 @@ def client_tls_environment(certificate, expected_name="localhost"):
     environment["NEXUS_TLS_CA_FILE"] = str(certificate.certificate)
     environment["NEXUS_TLS_SERVER_NAME"] = expected_name
     return environment
+
+
+def tls_client_connection(host, port, timeout=3):
+    context = ssl.create_default_context(cafile=os.environ["NEXUS_TLS_CA_FILE"])
+    raw_socket = socket.create_connection((host, port), timeout=timeout)
+    try:
+        return context.wrap_socket(
+            raw_socket,
+            server_hostname=os.environ.get("NEXUS_TLS_SERVER_NAME", host),
+        )
+    except Exception:
+        raw_socket.close()
+        raise
+
+
+def tls_client_when_ready(host, port, timeout=3):
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            return tls_client_connection(host, port, timeout=0.5)
+        except OSError as error:
+            last_error = error
+            time.sleep(0.05)
+    raise RuntimeError(f"TLS listener on port {port} did not start: {last_error}")
+
+
+def tls_server_connection(raw_socket):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.load_cert_chain(
+        certfile=os.environ["NEXUS_TLS_CERT_FILE"],
+        keyfile=os.environ["NEXUS_TLS_KEY_FILE"],
+    )
+    return context.wrap_socket(raw_socket, server_side=True)

@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 
+from security_test_support import tls_client_when_ready, tls_server_connection
+
 
 HEADER_FORMAT = "!BBHII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -73,9 +75,7 @@ def main():
             stderr=subprocess.STDOUT,
         )
         time.sleep(0.2)
-        idle_tunnel = socket.create_connection(
-            ("127.0.0.1", edge_tunnel_port), timeout=2
-        )
+        idle_tunnel = tls_client_when_ready("127.0.0.1", edge_tunnel_port)
 
         # This fake edge accepts PING but never answers. The same client process
         # must abandon the dead session and establish a second connection.
@@ -91,7 +91,8 @@ def main():
             )
 
             listener.settimeout(4)
-            first_tunnel, _ = listener.accept()
+            raw_first_tunnel, _ = listener.accept()
+            first_tunnel = tls_server_connection(raw_first_tunnel)
             first_tunnel.settimeout(4)
             version, message_type, flags, stream_id, payload = receive_frame(
                 first_tunnel
@@ -106,7 +107,8 @@ def main():
                 raise RuntimeError("client did not begin its liveness handshake")
 
             listener.settimeout(20)
-            second_tunnel, _ = listener.accept()
+            raw_second_tunnel, _ = listener.accept()
+            second_tunnel = tls_server_connection(raw_second_tunnel)
             if client.poll() is not None:
                 raise RuntimeError("client exited instead of reconnecting")
 

@@ -188,6 +188,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_single_request
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
@@ -197,6 +198,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_concurrent_streams
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrent_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
@@ -206,6 +208,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_disconnect_reconnect
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/reconnect_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
@@ -215,6 +218,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_automatic_reconnect
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/automatic_reconnect_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
@@ -224,6 +228,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_heartbeat
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/heartbeat_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
@@ -233,6 +238,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_timeouts
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
@@ -242,6 +248,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_graceful_shutdown
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/shutdown_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
@@ -251,6 +258,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_logging_and_limits
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/logging_and_limits_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
@@ -260,6 +268,7 @@ if(BUILD_TESTING)
     add_test(
         NAME integration_protocol_and_limits
         COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/protection_test.py
                 $<TARGET_FILE:nexus-edge>
                 $<TARGET_FILE:nexus-client>
