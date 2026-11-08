@@ -54,6 +54,9 @@ The maximum complete frame size is 65,548 bytes.
 | 5 | `CLOSE` | Either direction | Nonzero | Empty. |
 | 6 | `PING` | Either direction | `0` | Exactly 8 opaque bytes. |
 | 7 | `PONG` | Either direction | `0` | The same 8 bytes received in `PING`. |
+| 8 | `AUTH` | Client to edge | `0` | 32–256 opaque token bytes. |
+| 9 | `AUTH_OK` | Edge to client | `0` | Empty. |
+| 10 | `AUTH_FAILED` | Edge to client | `0` | Empty. |
 
 Message type `0` is invalid. Unknown message types are protocol errors.
 
@@ -98,6 +101,21 @@ and does not represent TCP half-close separately.
 opaque 8-byte value chosen by the sender. The receiver returns the exact value
 in `PONG`. Heartbeat timing will be added during the reliability phase.
 
+### `AUTH`, `AUTH_OK`, and `AUTH_FAILED`
+
+After completing TLS, the client sends exactly one `AUTH` frame before any
+registration, heartbeat, or stream frame. Its payload is an opaque token between
+32 and 256 bytes. TLS protects the token in transit; implementations must never
+write it to logs.
+
+The edge compares the token with its configured secret. It returns an empty
+`AUTH_OK` frame on success. On failure it may return empty `AUTH_FAILED`, then
+closes the TLS connection. The response deliberately provides no detail about
+which part of authentication failed.
+
+The edge must not create public routing state or accept public streams until
+authentication succeeds.
+
 ## Stream ID rules
 
 - Stream ID `0` is reserved for tunnel-level control messages.
@@ -112,6 +130,8 @@ in `PONG`. Heartbeat timing will be added during the reliability phase.
 
 ```text
 client                         edge
+  |------ AUTH ---------------->|
+  |<----- AUTH_OK ---------------|
   |------ REGISTER ------------>|
   |<----- REGISTER_OK -----------|
   |                              |
@@ -408,6 +428,9 @@ enum class MessageType : std::uint8_t {
     Close = 5,
     Ping = 6,
     Pong = 7,
+    Authenticate = 8,
+    AuthenticateOk = 9,
+    AuthenticateFailed = 10,
 };
 ```
 
@@ -582,8 +605,8 @@ Writing fields manually also avoids two unsafe assumptions:
 ## 11. Validation rules
 
 `isKnownMessageType()` checks that a raw byte lies between the first and last
-currently assigned type values. This works because version 1 assigns the seven
-types consecutive values from 1 through 7. If future values contain gaps, this
+currently assigned type values. This works because version 1 assigns the ten
+types consecutive values from 1 through 10. If future values contain gaps, this
 helper should become an explicit `switch`.
 
 `validateFields()` returns an empty `std::string_view` when fields are valid and
@@ -607,6 +630,7 @@ The main structural rules are:
 - `OPEN` and `CLOSE` have empty payloads;
 - `DATA` has at least one byte;
 - `PING` and `PONG` have exactly eight bytes; and
+- `AUTH` contains 32–256 bytes while its responses are empty; and
 - no payload exceeds 65,536 bytes.
 
 `isValidTunnelName()` uses `std::all_of()`:
