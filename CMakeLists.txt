@@ -186,6 +186,15 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME integration_tls_verification
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_verification_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_tls_verification PROPERTIES TIMEOUT 20)
+
+    add_test(
         NAME integration_single_request
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
