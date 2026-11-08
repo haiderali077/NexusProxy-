@@ -53,6 +53,7 @@ target_link_libraries(nexus_protocol PRIVATE
 )
 
 add_library(nexus_security STATIC
+    secret_config.cpp
     tls_connection.cpp
     tls_context.cpp
     tls_error.cpp
@@ -184,6 +185,16 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_context_test.py
                 $<TARGET_FILE:tls_context_tests>
     )
+
+    add_executable(secret_config_tests
+        secret_config_tests.cpp
+    )
+    target_link_libraries(secret_config_tests PRIVATE
+        nexus_security
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(NAME secret_config_tests COMMAND secret_config_tests)
 
     add_test(
         NAME integration_tls_verification
