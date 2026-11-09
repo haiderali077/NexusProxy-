@@ -237,6 +237,16 @@ if(BUILD_TESTING)
     set_tests_properties(integration_authentication_security PROPERTIES TIMEOUT 20)
 
     add_test(
+        NAME integration_tunnel_confidentiality
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tunnel_confidentiality_test.py
+                $<TARGET_FILE:nexus-edge>
+                $<TARGET_FILE:nexus-client>
+    )
+    set_tests_properties(integration_tunnel_confidentiality PROPERTIES TIMEOUT 20)
+
+    add_test(
         NAME integration_single_request
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/with_tls.py

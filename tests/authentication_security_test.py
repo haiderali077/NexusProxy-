@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os
+import secrets
 import socket
 import ssl
 import struct
@@ -83,8 +83,8 @@ def main():
         return 2
 
     certificate = TestCertificate()
-    correct_token = "correct-token-material-0123456789abcdef"
-    wrong_token = "incorrect-token-value-0123456789abcdef"
+    correct_token = secrets.token_urlsafe(32)
+    wrong_token = secrets.token_urlsafe(32)
     tunnel_port = unused_port()
     public_port = unused_port()
     edge = None
