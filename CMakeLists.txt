@@ -54,6 +54,7 @@ target_link_libraries(nexus_protocol PRIVATE
 
 add_library(nexus_security STATIC
     secret_config.cpp
+    secure_token.cpp
     tls_connection.cpp
     tls_context.cpp
     tls_error.cpp
@@ -195,6 +196,16 @@ if(BUILD_TESTING)
         nexus_sanitizers
     )
     add_test(NAME secret_config_tests COMMAND secret_config_tests)
+
+    add_executable(secure_token_tests
+        secure_token_tests.cpp
+    )
+    target_link_libraries(secure_token_tests PRIVATE
+        nexus_security
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(NAME secure_token_tests COMMAND secure_token_tests)
 
     add_test(
         NAME integration_tls_verification
