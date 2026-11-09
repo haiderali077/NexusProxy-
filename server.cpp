@@ -5,6 +5,7 @@
 
 #include "config.hpp"
 #include "authentication.hpp"
+#include "auth_rate_limiter.hpp"
 #include "heartbeat.hpp"
 #include "limits.hpp"
 #include "logging.hpp"
@@ -256,6 +257,8 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   nexus::security::SecureToken authenticationToken{*loadedToken};
+  nexus::security::AuthenticationRateLimiter authenticationLimiter{3, 10s,
+                                                                    2s};
 
   UniqueSocket tunnelListener{nexus::net::createTcpListener(tunnelPort)};
   if (!tunnelListener) {
@@ -377,6 +380,10 @@ int main(int argc, char *argv[]) {
           nexus::logging::writeEvent(
               std::cerr, "edge", activeTunnelId, std::nullopt,
               "rejected another tunnel at the active limit");
+        } else if (!authenticationLimiter.allowAttempt(
+                       std::chrono::steady_clock::now())) {
+          std::cerr << "Rejected tunnel while authentication rate limit is active"
+                    << std::endl;
         } else if (!setNonBlocking(accepted.get())) {
           std::cerr << "Failed to make tunnel non-blocking" << std::endl;
         } else {
@@ -396,9 +403,12 @@ int main(int argc, char *argv[]) {
               kAuthenticationTimeout, tlsError);
           if (authentication !=
               nexus::security::AuthenticationResult::Succeeded) {
+            authenticationLimiter.recordFailure(
+                std::chrono::steady_clock::now());
             std::cerr << "Rejected unauthenticated tunnel" << std::endl;
             continue;
           }
+          authenticationLimiter.recordSuccess();
           // Only an encrypted, authenticated socket becomes the active tunnel.
           // Until this assignment, the public listener remains disabled.
           tunnelSocket = std::move(accepted);

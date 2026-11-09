@@ -53,6 +53,7 @@ target_link_libraries(nexus_protocol PRIVATE
 )
 
 add_library(nexus_security STATIC
+    auth_rate_limiter.cpp
     secret_config.cpp
     secure_token.cpp
     tls_connection.cpp
@@ -208,6 +209,16 @@ if(BUILD_TESTING)
     )
     add_test(NAME secure_token_tests COMMAND secure_token_tests)
 
+    add_executable(auth_rate_limiter_tests
+        auth_rate_limiter_tests.cpp
+    )
+    target_link_libraries(auth_rate_limiter_tests PRIVATE
+        nexus_security
+        nexus_warnings
+        nexus_sanitizers
+    )
+    add_test(NAME auth_rate_limiter_tests COMMAND auth_rate_limiter_tests)
+
     add_test(
         NAME integration_tls_verification
         COMMAND ${Python3_EXECUTABLE}
@@ -216,6 +227,14 @@ if(BUILD_TESTING)
                 $<TARGET_FILE:nexus-client>
     )
     set_tests_properties(integration_tls_verification PROPERTIES TIMEOUT 20)
+
+    add_test(
+        NAME integration_authentication_security
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/authentication_security_test.py
+                $<TARGET_FILE:nexus-edge>
+    )
+    set_tests_properties(integration_authentication_security PROPERTIES TIMEOUT 20)
 
     add_test(
         NAME integration_single_request
