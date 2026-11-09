@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-from security_test_support import TestCertificate
+from security_test_support import TEST_AUTH_TOKEN, TestCertificate
 
 
 def main():
@@ -19,6 +19,7 @@ def main():
         environment["NEXUS_TLS_KEY_FILE"] = str(certificate.private_key)
         environment["NEXUS_TLS_CA_FILE"] = str(certificate.certificate)
         environment["NEXUS_TLS_SERVER_NAME"] = "localhost"
+        environment["NEXUS_AUTH_TOKEN"] = TEST_AUTH_TOKEN
         result = subprocess.run(
             [sys.executable, *sys.argv[1:]],
             env=environment,

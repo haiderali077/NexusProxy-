@@ -4,12 +4,15 @@
 // separate connection to the local service, and stream IDs route DATA frames.
 
 #include "config.hpp"
+#include "authentication.hpp"
 #include "heartbeat.hpp"
 #include "limits.hpp"
 #include "logging.hpp"
 #include "protocol.hpp"
 #include "relay.hpp"
 #include "retry.hpp"
+#include "secret_config.hpp"
+#include "secure_token.hpp"
 #include "shutdown.hpp"
 #include "socket_utils.hpp"
 #include "tls_connection.hpp"
@@ -60,6 +63,7 @@ constexpr auto kHeartbeatInterval = 5s;
 constexpr auto kPongTimeout = 15s;
 constexpr auto kConnectTimeout = 5s;
 constexpr auto kTlsHandshakeTimeout = 5s;
+constexpr auto kAuthenticationTimeout = 5s;
 
 struct LocalStream {
   UniqueSocket socket;
@@ -285,6 +289,17 @@ int main(int argc, char *argv[]) {
     std::cerr << "Failed to configure client TLS: " << tlsError << std::endl;
     return 1;
   }
+  std::string secretError;
+  auto loadedToken = nexus::security::loadSecret(
+      "NEXUS_AUTH_TOKEN", "NEXUS_AUTH_TOKEN_FILE",
+      nexus::protocol::kMinAuthTokenSize,
+      nexus::protocol::kMaxAuthTokenSize, secretError);
+  if (!loadedToken) {
+    std::cerr << "Failed to load authentication token: " << secretError
+              << std::endl;
+    return 1;
+  }
+  nexus::security::SecureToken authenticationToken{*loadedToken};
 
   ReconnectBackoff reconnectBackoff{250ms, 10s};
   std::uint64_t nextTunnelId = 1;
@@ -318,8 +333,18 @@ int main(int argc, char *argv[]) {
       waitBeforeReconnect(reconnectBackoff, "Secure tunnel setup failed");
       continue;
     }
+    tlsError.clear();
+    const auto authentication = nexus::security::authenticateClient(
+        tunnelSocket.get(), *tunnelTls, authenticationToken,
+        kAuthenticationTimeout, tlsError);
+    if (authentication !=
+        nexus::security::AuthenticationResult::Succeeded) {
+      std::cerr << "Tunnel authentication failed: " << tlsError << std::endl;
+      waitBeforeReconnect(reconnectBackoff, "Secure tunnel setup failed");
+      continue;
+    }
 
-    // Reset backoff only after encryption and identity verification succeed.
+    // Reset only after the edge identity and client token are both accepted.
     reconnectBackoff.reset();
     const std::uint64_t tunnelId = nextTunnelId++;
     nexus::logging::writeEvent(std::cout, "client", tunnelId, std::nullopt,

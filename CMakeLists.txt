@@ -72,6 +72,7 @@ target_link_libraries(nexus_security PRIVATE
 )
 
 add_library(nexus_runtime STATIC
+    authentication.cpp
     config.cpp
     heartbeat.cpp
     logging.cpp

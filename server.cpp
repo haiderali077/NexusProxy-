@@ -4,11 +4,14 @@
 // connection through it. Protocol stream IDs keep each conversation separate.
 
 #include "config.hpp"
+#include "authentication.hpp"
 #include "heartbeat.hpp"
 #include "limits.hpp"
 #include "logging.hpp"
 #include "protocol.hpp"
 #include "relay.hpp"
+#include "secret_config.hpp"
+#include "secure_token.hpp"
 #include "shutdown.hpp"
 #include "socket_utils.hpp"
 #include "tls_connection.hpp"
@@ -52,6 +55,7 @@ constexpr int kTunnelPort = 7000;
 constexpr int kPublicPort = 8000;
 constexpr auto kTunnelIdleTimeout = 20s;
 constexpr auto kTlsHandshakeTimeout = 5s;
+constexpr auto kAuthenticationTimeout = 5s;
 static_assert(nexus::limits::kMaxConcurrentTunnels == 1,
               "the current edge owns one active tunnel");
 
@@ -241,6 +245,17 @@ int main(int argc, char *argv[]) {
     std::cerr << "Failed to configure edge TLS: " << tlsError << std::endl;
     return 1;
   }
+  std::string secretError;
+  auto loadedToken = nexus::security::loadSecret(
+      "NEXUS_AUTH_TOKEN", "NEXUS_AUTH_TOKEN_FILE",
+      nexus::protocol::kMinAuthTokenSize,
+      nexus::protocol::kMaxAuthTokenSize, secretError);
+  if (!loadedToken) {
+    std::cerr << "Failed to load authentication token: " << secretError
+              << std::endl;
+    return 1;
+  }
+  nexus::security::SecureToken authenticationToken{*loadedToken};
 
   UniqueSocket tunnelListener{nexus::net::createTcpListener(tunnelPort)};
   if (!tunnelListener) {
@@ -375,6 +390,17 @@ int main(int argc, char *argv[]) {
                       << tlsError << std::endl;
             continue;
           }
+          tlsError.clear();
+          const auto authentication = nexus::security::authenticateServer(
+              accepted.get(), *acceptedTls, authenticationToken,
+              kAuthenticationTimeout, tlsError);
+          if (authentication !=
+              nexus::security::AuthenticationResult::Succeeded) {
+            std::cerr << "Rejected unauthenticated tunnel" << std::endl;
+            continue;
+          }
+          // Only an encrypted, authenticated socket becomes the active tunnel.
+          // Until this assignment, the public listener remains disabled.
           tunnelSocket = std::move(accepted);
           tunnelTls = std::move(*acceptedTls);
           activeTunnelId = nextTunnelId++;
