@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 
+from security_test_support import tls_client_when_ready
+
 
 HEADER_FORMAT = "!BBHII"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -74,7 +76,7 @@ def test_stream_limit(edge_path):
     tunnel = None
     public_connections = []
     try:
-        tunnel = connect_when_ready(tunnel_port)
+        tunnel = tls_client_when_ready("127.0.0.1", tunnel_port)
         tunnel.settimeout(3)
         stream_ids = set()
         for _ in range(MAX_STREAMS):

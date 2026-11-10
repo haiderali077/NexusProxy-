@@ -40,7 +40,7 @@ std::uint32_t readUint32(const std::vector<std::uint8_t>& input,
 
 bool isKnownMessageType(std::uint8_t value) {
     return value >= static_cast<std::uint8_t>(MessageType::Register) &&
-           value <= static_cast<std::uint8_t>(MessageType::Pong);
+           value <= static_cast<std::uint8_t>(MessageType::AuthenticateFailed);
 }
 
 std::string_view validateFields(MessageType type, std::uint32_t streamId,
@@ -86,6 +86,26 @@ std::string_view validateFields(MessageType type, std::uint32_t streamId,
             }
             if (payloadLength != 8) {
                 return "PING and PONG payloads must contain 8 bytes";
+            }
+            return {};
+
+        case MessageType::Authenticate:
+            if (streamId != 0) {
+                return "AUTH must use stream 0";
+            }
+            if (payloadLength < kMinAuthTokenSize ||
+                payloadLength > kMaxAuthTokenSize) {
+                return "AUTH token length is invalid";
+            }
+            return {};
+
+        case MessageType::AuthenticateOk:
+        case MessageType::AuthenticateFailed:
+            if (streamId != 0) {
+                return "authentication responses must use stream 0";
+            }
+            if (payloadLength != 0) {
+                return "authentication responses must have an empty payload";
             }
             return {};
     }

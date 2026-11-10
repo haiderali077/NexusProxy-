@@ -4,13 +4,20 @@
 // connection through it. Protocol stream IDs keep each conversation separate.
 
 #include "config.hpp"
+#include "authentication.hpp"
+#include "auth_rate_limiter.hpp"
 #include "heartbeat.hpp"
 #include "limits.hpp"
 #include "logging.hpp"
 #include "protocol.hpp"
 #include "relay.hpp"
+#include "secret_config.hpp"
+#include "secure_token.hpp"
 #include "shutdown.hpp"
 #include "socket_utils.hpp"
+#include "tls_connection.hpp"
+#include "tls_context.hpp"
+#include "tls_transport.hpp"
 #include "unique_socket.hpp"
 
 #include <algorithm>
@@ -19,6 +26,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -36,7 +44,8 @@ namespace {
 using namespace std::chrono_literals;
 
 using nexus::net::flushOutput;
-using nexus::net::drainOutput;
+using nexus::net::drainTlsOutput;
+using nexus::net::flushTlsOutput;
 using nexus::net::FlushResult;
 using nexus::net::OutputQueue;
 using nexus::net::queueFrame;
@@ -46,6 +55,8 @@ using nexus::net::UniqueSocket;
 constexpr int kTunnelPort = 7000;
 constexpr int kPublicPort = 8000;
 constexpr auto kTunnelIdleTimeout = 20s;
+constexpr auto kTlsHandshakeTimeout = 5s;
+constexpr auto kAuthenticationTimeout = 5s;
 static_assert(nexus::limits::kMaxConcurrentTunnels == 1,
               "the current edge owns one active tunnel");
 
@@ -220,6 +231,35 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  const char *certificateFile = std::getenv("NEXUS_TLS_CERT_FILE");
+  const char *privateKeyFile = std::getenv("NEXUS_TLS_KEY_FILE");
+  if (certificateFile == nullptr || *certificateFile == '\0' ||
+      privateKeyFile == nullptr || *privateKeyFile == '\0') {
+    std::cerr << "NEXUS_TLS_CERT_FILE and NEXUS_TLS_KEY_FILE are required"
+              << std::endl;
+    return 1;
+  }
+  std::string tlsError;
+  auto tlsContext = nexus::security::TlsContext::createServer(
+      certificateFile, privateKeyFile, tlsError);
+  if (!tlsContext) {
+    std::cerr << "Failed to configure edge TLS: " << tlsError << std::endl;
+    return 1;
+  }
+  std::string secretError;
+  auto loadedToken = nexus::security::loadSecret(
+      "NEXUS_AUTH_TOKEN", "NEXUS_AUTH_TOKEN_FILE",
+      nexus::protocol::kMinAuthTokenSize,
+      nexus::protocol::kMaxAuthTokenSize, secretError);
+  if (!loadedToken) {
+    std::cerr << "Failed to load authentication token: " << secretError
+              << std::endl;
+    return 1;
+  }
+  nexus::security::SecureToken authenticationToken{*loadedToken};
+  nexus::security::AuthenticationRateLimiter authenticationLimiter{3, 10s,
+                                                                    2s};
+
   UniqueSocket tunnelListener{nexus::net::createTcpListener(tunnelPort)};
   if (!tunnelListener) {
     std::cerr << "Failed to listen on tunnel port " << tunnelPort << ": "
@@ -237,6 +277,7 @@ int main(int argc, char *argv[]) {
   std::cout << "Listening on port " << publicPort << std::endl;
 
   UniqueSocket tunnelSocket;
+  std::optional<nexus::security::TlsConnection> tunnelTls;
   std::uint32_t nextStreamId = 1;
   std::unordered_map<std::uint32_t, PublicStream> publicStreams;
   nexus::protocol::FrameDecoder tunnelDecoder;
@@ -245,11 +286,17 @@ int main(int argc, char *argv[]) {
   std::uint64_t nextTunnelId = 1;
   std::uint64_t activeTunnelId = 0;
   bool running = true;
+  bool tlsReadWantsWrite = false;
+  bool tlsWriteWantsRead = false;
 
   auto disconnectTunnel = [&] {
     if (tunnelSocket) {
       nexus::logging::writeEvent(std::cout, "edge", activeTunnelId,
                                  std::nullopt, "tunnel disconnected");
+    }
+    if (tunnelTls) {
+      tunnelTls->shutdown();
+      tunnelTls.reset();
     }
     tunnelSocket.reset();
     tunnelOutput.clear();
@@ -257,6 +304,8 @@ int main(int argc, char *argv[]) {
     tunnelIdleDeadline.reset();
     closeAllPublicStreams(publicStreams, activeTunnelId);
     activeTunnelId = 0;
+    tlsReadWantsWrite = false;
+    tlsWriteWantsRead = false;
   };
 
   while (running && !nexus::process::shutdownRequested()) {
@@ -275,7 +324,7 @@ int main(int argc, char *argv[]) {
     if (tunnelSocket) {
       tunnelPollIndex = pollFds.size();
       short events = POLLIN;
-      if (!tunnelOutput.empty()) {
+      if (!tunnelOutput.empty() || tlsReadWantsWrite) {
         events |= POLLOUT;
       }
       pollFds.push_back({tunnelSocket.get(), events, 0});
@@ -331,10 +380,39 @@ int main(int argc, char *argv[]) {
           nexus::logging::writeEvent(
               std::cerr, "edge", activeTunnelId, std::nullopt,
               "rejected another tunnel at the active limit");
+        } else if (!authenticationLimiter.allowAttempt(
+                       std::chrono::steady_clock::now())) {
+          std::cerr << "Rejected tunnel while authentication rate limit is active"
+                    << std::endl;
         } else if (!setNonBlocking(accepted.get())) {
           std::cerr << "Failed to make tunnel non-blocking" << std::endl;
         } else {
+          tlsError.clear();
+          auto acceptedTls = nexus::security::TlsConnection::createServer(
+              *tlsContext, accepted.get(), tlsError);
+          if (!acceptedTls || !nexus::net::performTlsHandshake(
+                                  accepted.get(), *acceptedTls,
+                                  kTlsHandshakeTimeout, tlsError)) {
+            std::cerr << "Rejected tunnel with failed TLS handshake: "
+                      << tlsError << std::endl;
+            continue;
+          }
+          tlsError.clear();
+          const auto authentication = nexus::security::authenticateServer(
+              accepted.get(), *acceptedTls, authenticationToken,
+              kAuthenticationTimeout, tlsError);
+          if (authentication !=
+              nexus::security::AuthenticationResult::Succeeded) {
+            authenticationLimiter.recordFailure(
+                std::chrono::steady_clock::now());
+            std::cerr << "Rejected unauthenticated tunnel" << std::endl;
+            continue;
+          }
+          authenticationLimiter.recordSuccess();
+          // Only an encrypted, authenticated socket becomes the active tunnel.
+          // Until this assignment, the public listener remains disabled.
           tunnelSocket = std::move(accepted);
+          tunnelTls = std::move(*acceptedTls);
           activeTunnelId = nextTunnelId++;
           // Any valid tunnel traffic refreshes this deadline. Healthy clients
           // remain connected because their PING frames arrive well before it.
@@ -400,23 +478,36 @@ int main(int argc, char *argv[]) {
         tunnelPollIndex != std::numeric_limits<std::size_t>::max()) {
       const short events = pollFds[tunnelPollIndex].revents;
 
-      if (events & POLLOUT) {
-        if (flushOutput(tunnelSocket.get(), tunnelOutput) !=
-            FlushResult::Ready) {
+      if (!tunnelOutput.empty() &&
+          ((events & POLLOUT) ||
+           (tlsWriteWantsRead && (events & POLLIN)))) {
+        tlsError.clear();
+        const auto status = flushTlsOutput(*tunnelTls, tunnelOutput, tlsError);
+        tlsWriteWantsRead =
+            status == nexus::security::TlsStatus::WantRead;
+        if (status != nexus::security::TlsStatus::Complete &&
+            status != nexus::security::TlsStatus::WantRead &&
+            status != nexus::security::TlsStatus::WantWrite) {
+          std::cerr << "Encrypted tunnel write failed: " << tlsError
+                    << std::endl;
           disconnectTunnel();
         }
       }
 
-      if (tunnelSocket && (events & (POLLIN | POLLHUP))) {
+      if (tunnelSocket &&
+          ((events & (POLLIN | POLLHUP)) ||
+           (tlsReadWantsWrite && (events & POLLOUT)))) {
         std::uint8_t buffer[nexus::limits::kReadBufferBytes];
         while (true) {
-          const ssize_t received =
-              recv(tunnelSocket.get(), buffer, sizeof(buffer), 0);
-          if (received > 0) {
+          tlsError.clear();
+          const auto result = tunnelTls->read(buffer, tlsError);
+          if (result.status == nexus::security::TlsStatus::Complete &&
+              result.bytes > 0) {
+            tlsReadWantsWrite = false;
             tunnelIdleDeadline =
                 std::chrono::steady_clock::now() + kTunnelIdleTimeout;
             tunnelDecoder.append(std::span<const std::uint8_t>(
-                buffer, static_cast<std::size_t>(received)));
+                buffer, result.bytes));
             if (!handleTunnelFrames(tunnelDecoder, publicStreams, tunnelOutput,
                                     activeTunnelId)) {
               disconnectTunnel();
@@ -424,17 +515,19 @@ int main(int argc, char *argv[]) {
             }
             continue;
           }
-          if (received == 0) {
+          if (result.status == nexus::security::TlsStatus::WantRead) {
+            tlsReadWantsWrite = false;
+            break;
+          }
+          if (result.status == nexus::security::TlsStatus::WantWrite) {
+            tlsReadWantsWrite = true;
+            break;
+          }
+          if (result.status == nexus::security::TlsStatus::Closed) {
             disconnectTunnel();
             break;
           }
-          if (errno == EINTR) {
-            continue;
-          }
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-          }
-          std::cerr << "Tunnel recv() failed: " << std::strerror(errno)
+          std::cerr << "Encrypted tunnel read failed: " << tlsError
                     << std::endl;
           disconnectTunnel();
           break;
@@ -531,7 +624,9 @@ int main(int argc, char *argv[]) {
     }
     // Give CLOSE frames a brief chance to leave, then rely on RAII even if the
     // peer is stalled. A shutdown path must have its own deadline too.
-    drainOutput(tunnelSocket.get(), tunnelOutput, 1s);
+    tlsError.clear();
+    drainTlsOutput(tunnelSocket.get(), *tunnelTls, tunnelOutput, 1s, tlsError);
+    tunnelTls->shutdown();
   }
   closeAllPublicStreams(publicStreams, activeTunnelId);
   if (nexus::process::shutdownRequested()) {

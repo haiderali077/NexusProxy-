@@ -13,6 +13,8 @@ namespace nexus::protocol {
 inline constexpr std::uint8_t kProtocolVersion = 1;
 inline constexpr std::size_t kFrameHeaderSize = 12;
 inline constexpr std::uint32_t kMaxPayloadSize = 65'536;
+inline constexpr std::size_t kMinAuthTokenSize = 32;
+inline constexpr std::size_t kMaxAuthTokenSize = 256;
 
 enum class MessageType : std::uint8_t {
     Register = 1,
@@ -22,6 +24,9 @@ enum class MessageType : std::uint8_t {
     Close = 5,
     Ping = 6,
     Pong = 7,
+    Authenticate = 8,
+    AuthenticateOk = 9,
+    AuthenticateFailed = 10,
 };
 
 // Frame stores normal C++ values. encodeFrame() converts them to wire bytes.

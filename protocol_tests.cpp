@@ -193,6 +193,27 @@ void testInvalidFlags() {
            "nonzero reserved flags were accepted");
 }
 
+void testAuthenticationFrames() {
+    std::vector<std::uint8_t> token(nexus::protocol::kMinAuthTokenSize, 0xA5);
+    token[0] = 0;
+    const Frame expected{MessageType::Authenticate, 0, token};
+
+    FrameDecoder decoder;
+    decoder.append(encode(expected));
+    Frame actual;
+    expect(decoder.nextFrame(actual) == DecodeStatus::FrameReady,
+           "AUTH frame was not decoded");
+    expectSameFrame(actual, expected);
+
+    std::vector<std::uint8_t> output;
+    expect(!encodeFrame(Frame{MessageType::Authenticate, 0, {'s'}}, output),
+           "short authentication token was encoded");
+    expect(!encodeFrame(Frame{MessageType::AuthenticateOk, 0, {0x01}}, output),
+           "AUTH_OK with a payload was encoded");
+    expect(encodeFrame(Frame{MessageType::AuthenticateFailed, 0, {}}, output),
+           "empty AUTH_FAILED frame was rejected");
+}
+
 } // namespace
 
 int main() {
@@ -207,6 +228,7 @@ int main() {
         testHeaderEncoding();
         testEncoderValidation();
         testInvalidFlags();
+        testAuthenticationFrames();
     } catch (const std::exception& error) {
         std::cerr << "Protocol test failed: " << error.what() << std::endl;
         return 1;

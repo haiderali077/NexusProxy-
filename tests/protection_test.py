@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 
+from security_test_support import tls_client_when_ready
+
 
 LARGE_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -61,7 +63,7 @@ def watch_edge_logs(edge, limit_reached):
 def reject_malformed_tunnel(tunnel_port):
     # version=99, type=OPEN, flags=0, stream=1, payload length=0
     malformed = struct.pack("!BBHII", 99, 3, 0, 1, 0)
-    with socket.create_connection(("127.0.0.1", tunnel_port), timeout=2) as raw:
+    with tls_client_when_ready("127.0.0.1", tunnel_port) as raw:
         raw.settimeout(3)
         raw.sendall(malformed)
         try:
