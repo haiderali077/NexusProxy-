@@ -8,8 +8,9 @@ that stream into frames. Frames tell both programs whether the bytes open a
 public stream, carry application data, close a stream, or manage the tunnel.
 
 This document defines protocol version 1. The frame types are declared in
-`protocol.hpp`, implemented in `protocol.cpp`, and checked by
-`protocol_tests.cpp`.
+`include/nexus/protocol.hpp`, implemented in
+`src/protocol/protocol.cpp`, and checked by
+`tests/unit/protocol_tests.cpp`.
 
 ## Byte order and encoding
 
@@ -179,8 +180,8 @@ continuing with different interpretations of the byte stream.
 
 ## Implementation order
 
-1. Add shared frame types and constants in `protocol.hpp`.
-2. Encode complete frames in `protocol.cpp`.
+1. Add shared frame types and constants in `include/nexus/protocol.hpp`.
+2. Encode complete frames in `src/protocol/protocol.cpp`.
 3. Add a stateful decoder that accepts arbitrary byte chunks.
 4. Unit-test split frames, combined frames, binary payloads, and invalid input.
 5. Replace the current one-byte `'O'` signal with `REGISTER`, `REGISTER_OK`, and
@@ -190,8 +191,9 @@ continuing with different interpretations of the byte stream.
 
 ## Version 1 limitations
 
-- The protocol is not encrypted or authenticated yet. It is not safe to expose
-  to untrusted networks until the security phase is complete.
+- The frame format does not encrypt or authenticate itself. The current client
+  and edge protect the tunnel with TLS and token authentication at the
+  transport layer.
 - Registration rejection has no detailed error response.
 - Stream priority, compression, and half-close are not supported.
 - Queue limits and backpressure belong to the multiplexing phase.
@@ -238,7 +240,7 @@ These two transformations are called:
 
 ## 2. What each file owns
 
-### `protocol.hpp`
+### `include/nexus/protocol.hpp`
 
 The header is the public interface. It contains the names and declarations that
 the client, edge, implementation, and tests are allowed to use:
@@ -253,7 +255,7 @@ the client, edge, implementation, and tests are allowed to use:
 The header does not contain the main algorithms. A source file can include the
 header without needing to know how the algorithms work.
 
-### `protocol.cpp`
+### `src/protocol/protocol.cpp`
 
 The implementation file defines the functions declared by the header. It owns:
 
@@ -263,7 +265,7 @@ The implementation file defines the functions declared by the header. It owns:
 - frame encoding; and
 - stateful frame decoding.
 
-### `protocol_tests.cpp`
+### `tests/unit/protocol_tests.cpp`
 
 The test file is a separate executable. It constructs known inputs, runs the
 protocol code, and reports failure when the observed result differs from the
@@ -282,8 +284,8 @@ ctest --test-dir build --output-on-failure
 when any test fails. To compile this protocol test directly without CMake:
 
 ```bash
-c++ -std=c++20 -Wall -Wextra -Wpedantic \
-  protocol.cpp protocol_tests.cpp -o protocol_tests
+c++ -std=c++20 -Wall -Wextra -Wpedantic -Iinclude \
+  src/protocol/protocol.cpp tests/unit/protocol_tests.cpp -o protocol_tests
 ./protocol_tests
 ```
 
@@ -310,7 +312,7 @@ once.
 ### `#include`
 
 ```cpp
-#include "protocol.hpp"
+#include "nexus/protocol.hpp"
 #include <vector>
 ```
 
@@ -331,9 +333,9 @@ Each included standard header provides a specific tool:
 | `<stdexcept>` | `std::runtime_error`, used by the test runner. |
 | `<iostream>` | `std::cout` and `std::cerr` for test output. |
 
-Including `protocol.hpp` first in `protocol.cpp` is useful: it proves the header
-declares all types needed by its own public interface instead of accidentally
-depending on another include.
+Including `nexus/protocol.hpp` first in `src/protocol/protocol.cpp` is useful:
+it proves the header declares all types needed by its own public interface
+instead of accidentally depending on another include.
 
 ### Declaration versus definition
 
@@ -344,8 +346,8 @@ bool encodeFrame(const Frame& frame, std::vector<std::uint8_t>& output);
 ```
 
 It tells the compiler the function's name, arguments, and return type. The body
-in `protocol.cpp` is the definition. The linker later connects calls from other
-translation units to that definition.
+in `src/protocol/protocol.cpp` is the definition. The linker later connects
+calls from other translation units to that definition.
 
 A **translation unit** is roughly one `.cpp` file after all of its includes have
 been expanded.
@@ -364,7 +366,7 @@ nexus::protocol::Frame
 
 The `::` operator selects a name inside a namespace, class, or enum.
 
-Inside `protocol.cpp` there is another namespace:
+Inside `src/protocol/protocol.cpp` there is another namespace:
 
 ```cpp
 namespace {
@@ -937,8 +939,9 @@ while (true) {
 }
 ```
 
-This is shortened example code. The real `client.cpp` and `server.cpp` use the
-same append-and-drain loop with their stream maps and cleanup rules.
+This is shortened example code. The real `apps/client_main.cpp` and
+`apps/edge_main.cpp` use the same append-and-drain loop with their stream maps
+and cleanup rules.
 
 The three statuses mean:
 
@@ -1102,9 +1105,9 @@ ctest --test-dir build-sanitized --output-on-failure
 The equivalent direct compiler command for the protocol test alone is:
 
 ```bash
-c++ -std=c++20 -Wall -Wextra -Wpedantic \
+c++ -std=c++20 -Wall -Wextra -Wpedantic -Iinclude \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
-  protocol.cpp protocol_tests.cpp -o protocol_tests
+  src/protocol/protocol.cpp tests/unit/protocol_tests.cpp -o protocol_tests
 ./protocol_tests
 ```
 
