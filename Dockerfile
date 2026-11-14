@@ -1,12 +1,32 @@
-FROM gcc:14.2.0
+FROM gcc:14.2.0 AS builder
 
-WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy only the source file so unrelated changes do not invalidate this layer.
-COPY server.cpp .
+WORKDIR /source
 
-# Build the Linux executable when the image is created.
-RUN g++ -std=c++20 -Wall -Wextra -Wpedantic server.cpp -o main
+# Copy build metadata first so Docker can reuse dependency-related layers.
+COPY CMakeLists.txt .
+COPY apps/CMakeLists.txt apps/CMakeLists.txt
+COPY src/CMakeLists.txt src/CMakeLists.txt
+COPY include include
+COPY apps apps
+COPY src src
 
-# Exec form forwards container signals directly to the program.
-CMD ["./main"]
+RUN cmake -S . -B build -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target nexus-edge -j2
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /source/build/nexus-edge /usr/local/bin/nexus-edge
+
+USER 10001:10001
+
+EXPOSE 7000 8000
+
+ENTRYPOINT ["nexus-edge"]
