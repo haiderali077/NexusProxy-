@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nexusproxy-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexusproxy-edge
+  template:
+    metadata:
+      labels:
+        app: nexusproxy-edge
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: edge
+          image: nexusproxy:1.0.0
+          imagePullPolicy: IfNotPresent
+          args: ["7000", "8000"]
+          ports:
+            - name: tunnel
+              containerPort: 7000
+            - name: public
+              containerPort: 8000
+          env:
+            - name: NEXUS_TLS_CERT_FILE
+              value: /run/secrets/nexus/tls.crt
+            - name: NEXUS_TLS_KEY_FILE
+              value: /run/secrets/nexus/tls.key
+            - name: NEXUS_AUTH_TOKEN_FILE
+              value: /run/secrets/nexus/auth-token
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: edge-secrets
+              mountPath: /run/secrets/nexus
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: edge-secrets
+          secret:
+            secretName: nexusproxy-edge-secrets
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexusproxy-edge
+spec:
+  type: LoadBalancer
+  selector:
+    app: nexusproxy-edge
+  ports:
+    - name: tunnel
+      port: 7000
+      targetPort: tunnel
+    - name: public
+      port: 8000
+      targetPort: public
