@@ -4,6 +4,7 @@
 // separate connection to the local service, and stream IDs route DATA frames.
 
 #include "nexus/config.hpp"
+#include "nexus/flow_control.hpp"
 #include "nexus/authentication.hpp"
 #include "nexus/heartbeat.hpp"
 #include "nexus/limits.hpp"
@@ -69,6 +70,8 @@ struct LocalStream {
   UniqueSocket socket;
   OutputQueue output;
   bool closeAfterFlush{};
+  nexus::flow::SendWindow sendWindow{
+      nexus::limits::kMaxStreamQueueBytes};
 };
 
 bool tunnelCanAcceptData(const OutputQueue &output) {
@@ -177,6 +180,17 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
     if (stream == streams.end()) {
       if (frame.type == nexus::protocol::MessageType::Data) {
         queueClose(tunnelOutput, frame.streamId);
+      }
+      continue;
+    }
+
+    if (frame.type == nexus::protocol::MessageType::WindowUpdate) {
+      std::uint32_t increment = 0;
+      if (!nexus::flow::decodeWindowIncrement(frame.payload, increment) ||
+          !stream->second.sendWindow.replenish(increment)) {
+        std::cerr << "Invalid WINDOW_UPDATE for local stream "
+                  << frame.streamId << std::endl;
+        return false;
       }
       continue;
     }
