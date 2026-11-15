@@ -214,6 +214,26 @@ void testAuthenticationFrames() {
            "empty AUTH_FAILED frame was rejected");
 }
 
+void testWindowUpdateFrames() {
+    const Frame expected{MessageType::WindowUpdate, 42,
+                         {0x00, 0x01, 0x00, 0x00}};
+
+    FrameDecoder decoder;
+    decoder.append(encode(expected));
+    Frame actual;
+    expect(decoder.nextFrame(actual) == DecodeStatus::FrameReady,
+           "WINDOW_UPDATE frame was not decoded");
+    expectSameFrame(actual, expected);
+
+    std::vector<std::uint8_t> output;
+    expect(!encodeFrame(Frame{MessageType::WindowUpdate, 0,
+                              {0x00, 0x01, 0x00, 0x00}},
+                        output),
+           "WINDOW_UPDATE with stream 0 was encoded");
+    expect(!encodeFrame(Frame{MessageType::WindowUpdate, 42, {0x01}}, output),
+           "WINDOW_UPDATE with the wrong payload length was encoded");
+}
+
 } // namespace
 
 int main() {
@@ -229,6 +249,7 @@ int main() {
         testEncoderValidation();
         testInvalidFlags();
         testAuthenticationFrames();
+        testWindowUpdateFrames();
     } catch (const std::exception& error) {
         std::cerr << "Protocol test failed: " << error.what() << std::endl;
         return 1;

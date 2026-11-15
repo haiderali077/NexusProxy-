@@ -27,6 +27,7 @@ enum class MessageType : std::uint8_t {
     Authenticate = 8,
     AuthenticateOk = 9,
     AuthenticateFailed = 10,
+    WindowUpdate = 11,
 };
 
 // Frame stores normal C++ values. encodeFrame() converts them to wire bytes.
