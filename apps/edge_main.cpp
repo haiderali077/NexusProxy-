@@ -347,9 +347,10 @@ int main(int argc, char *argv[]) {
     std::vector<WatchedStream> watchedStreams;
     watchedStreams.reserve(publicStreams.size());
     for (const auto &[streamId, stream] : publicStreams) {
-      short events =
-          !stream.closeAfterFlush && tunnelCanAcceptData(tunnelOutput) ? POLLIN
-                                                                       : 0;
+      const bool canRead = !stream.closeAfterFlush &&
+                           stream.sendWindow.available() > 0 &&
+                           tunnelCanAcceptData(tunnelOutput);
+      short events = canRead ? POLLIN : 0;
       if (!stream.output.empty()) {
         events |= POLLOUT;
       }
@@ -586,8 +587,13 @@ int main(int argc, char *argv[]) {
           if (!tunnelCanAcceptData(tunnelOutput)) {
             break;
           }
+          const std::size_t allowed =
+              current->second.sendWindow.allowedRead(sizeof(buffer));
+          if (allowed == 0) {
+            break;
+          }
           const ssize_t received =
-              recv(current->second.socket.get(), buffer, sizeof(buffer), 0);
+              recv(current->second.socket.get(), buffer, allowed, 0);
           if (received > 0) {
             const nexus::protocol::Frame dataFrame{
                 nexus::protocol::MessageType::Data,
@@ -597,6 +603,13 @@ int main(int argc, char *argv[]) {
                             nexus::limits::kMaxTunnelQueueBytes)) {
               std::cerr << "Failed to encode DATA for stream "
                         << watched.streamId << std::endl;
+              running = false;
+              streamFinished = true;
+            } else if (!current->second.sendWindow.consume(
+                           static_cast<std::size_t>(received))) {
+              std::cerr << "Public stream " << watched.streamId
+                        << " consumed more flow-control credit than available"
+                        << std::endl;
               running = false;
               streamFinished = true;
             }
