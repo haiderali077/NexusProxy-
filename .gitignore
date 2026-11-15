@@ -1,17 +1,17 @@
-# Project planning notes
-todo.md
-IMPLEMENTATION_PLAN.md
-TRACKER.md
-LEARNING_NOTES.md
-PHASE_*_LEARNING_NOTES.md
+# Private learning and planning documents
+/docs/learning/
 
 # Local editor and operating-system files
 .vscode/
 .idea/
+.clangd/
 .cache/
+.pytest_cache/
 .DS_Store
+Thumbs.db
 *.swp
 *.swo
+*.tmp
 *~
 
 # C++ build artifacts
@@ -42,3 +42,12 @@ __pycache__/
 .env.*
 !.env.example
 compile_commands.json
+
+# Local TLS and authentication material
+*.crt
+*.key
+*.pem
+*.p12
+*.pfx
+*.token
+/nexus-auth-token
