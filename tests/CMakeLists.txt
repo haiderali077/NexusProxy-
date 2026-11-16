@@ -73,6 +73,8 @@ nexus_add_tls_integration_test(
 nexus_add_tls_integration_test(
     integration_single_request integration_test.py 20)
 nexus_add_tls_integration_test(
+    integration_large_transfer large_transfer_test.py 30)
+nexus_add_tls_integration_test(
     integration_concurrent_streams concurrent_test.py 30)
 nexus_add_tls_integration_test(
     integration_disconnect_reconnect reconnect_test.py 30)
