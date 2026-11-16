@@ -126,6 +126,20 @@ bool queueClose(OutputQueue &tunnelOutput, std::uint32_t streamId) {
                     nexus::limits::kMaxTunnelQueueBytes);
 }
 
+bool queueWindowUpdate(OutputQueue &tunnelOutput, std::uint32_t streamId,
+                       std::size_t increment) {
+  if (increment == 0 ||
+      increment > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+  return queueFrame(
+      tunnelOutput,
+      {nexus::protocol::MessageType::WindowUpdate, streamId,
+       nexus::flow::encodeWindowIncrement(
+           static_cast<std::uint32_t>(increment))},
+      nexus::limits::kMaxTunnelQueueBytes);
+}
+
 void finishPublicStream(
     std::unordered_map<std::uint32_t, PublicStream> &streams,
     OutputQueue &tunnelOutput, std::uint32_t streamId, bool notifyClient,
@@ -186,9 +200,8 @@ bool handleTunnelFrames(
       if (!stream->second.output.append(
               frame.payload, nexus::limits::kMaxStreamQueueBytes)) {
         std::cerr << "Public stream " << frame.streamId
-                  << " exceeded its output limit" << std::endl;
-        queueClose(tunnelOutput, frame.streamId);
-        removePublicStream(streams, frame.streamId, tunnelId);
+                  << " exceeded the credit it was granted" << std::endl;
+        return false;
       }
       continue;
     }
@@ -562,12 +575,22 @@ int main(int argc, char *argv[]) {
 
       const short events = pollFds[watched.pollIndex].revents;
       if (events & POLLOUT) {
+        const std::size_t queuedBefore = stream->second.output.pending();
         const FlushResult result =
             flushOutput(stream->second.socket.get(), stream->second.output);
         if (result != FlushResult::Ready) {
           finishPublicStream(publicStreams, tunnelOutput, watched.streamId,
                              static_cast<bool>(tunnelSocket), activeTunnelId);
           continue;
+        }
+        const std::size_t flushed =
+            queuedBefore - stream->second.output.pending();
+        if (flushed > 0 &&
+            !queueWindowUpdate(tunnelOutput, watched.streamId, flushed)) {
+          std::cerr << "Failed to return flow-control credit for public stream "
+                    << watched.streamId << std::endl;
+          disconnectTunnel();
+          break;
         }
         if (stream->second.closeAfterFlush && stream->second.output.empty()) {
           removePublicStream(publicStreams, watched.streamId, activeTunnelId);
