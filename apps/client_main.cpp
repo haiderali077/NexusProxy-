@@ -4,6 +4,7 @@
 // separate connection to the local service, and stream IDs route DATA frames.
 
 #include "nexus/config.hpp"
+#include "nexus/flow_control.hpp"
 #include "nexus/authentication.hpp"
 #include "nexus/heartbeat.hpp"
 #include "nexus/limits.hpp"
@@ -69,6 +70,8 @@ struct LocalStream {
   UniqueSocket socket;
   OutputQueue output;
   bool closeAfterFlush{};
+  nexus::flow::SendWindow sendWindow{
+      nexus::limits::kMaxStreamQueueBytes};
 };
 
 bool tunnelCanAcceptData(const OutputQueue &output) {
@@ -82,6 +85,20 @@ bool queueClose(OutputQueue &tunnelOutput, std::uint32_t streamId) {
   return queueFrame(tunnelOutput,
                     {nexus::protocol::MessageType::Close, streamId, {}},
                     nexus::limits::kMaxTunnelQueueBytes);
+}
+
+bool queueWindowUpdate(OutputQueue &tunnelOutput, std::uint32_t streamId,
+                       std::size_t increment) {
+  if (increment == 0 ||
+      increment > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+  return queueFrame(
+      tunnelOutput,
+      {nexus::protocol::MessageType::WindowUpdate, streamId,
+       nexus::flow::encodeWindowIncrement(
+           static_cast<std::uint32_t>(increment))},
+      nexus::limits::kMaxTunnelQueueBytes);
 }
 
 void removeLocalStream(std::unordered_map<std::uint32_t, LocalStream> &streams,
@@ -181,13 +198,23 @@ bool handleTunnelFrames(nexus::protocol::FrameDecoder &decoder,
       continue;
     }
 
+    if (frame.type == nexus::protocol::MessageType::WindowUpdate) {
+      std::uint32_t increment = 0;
+      if (!nexus::flow::decodeWindowIncrement(frame.payload, increment) ||
+          !stream->second.sendWindow.replenish(increment)) {
+        std::cerr << "Invalid WINDOW_UPDATE for local stream "
+                  << frame.streamId << std::endl;
+        return false;
+      }
+      continue;
+    }
+
     if (frame.type == nexus::protocol::MessageType::Data) {
       if (!stream->second.output.append(
               frame.payload, nexus::limits::kMaxStreamQueueBytes)) {
         std::cerr << "Local stream " << frame.streamId
-                  << " exceeded its output limit" << std::endl;
-        queueClose(tunnelOutput, frame.streamId);
-        removeLocalStream(streams, frame.streamId, tunnelId);
+                  << " exceeded the credit it was granted" << std::endl;
+        return false;
       }
       continue;
     }
@@ -399,10 +426,10 @@ int main(int argc, char *argv[]) {
       std::vector<WatchedStream> watchedStreams;
       watchedStreams.reserve(localStreams.size());
       for (const auto &[streamId, stream] : localStreams) {
-        short events =
-            !stream.closeAfterFlush && tunnelCanAcceptData(tunnelOutput)
-                ? POLLIN
-                : 0;
+        const bool canRead = !stream.closeAfterFlush &&
+                             stream.sendWindow.available() > 0 &&
+                             tunnelCanAcceptData(tunnelOutput);
+        short events = canRead ? POLLIN : 0;
         if (!stream.output.empty()) {
           events |= POLLOUT;
         }
@@ -501,12 +528,24 @@ int main(int argc, char *argv[]) {
 
         const short events = pollFds[watched.pollIndex].revents;
         if (events & POLLOUT) {
+          const std::size_t queuedBefore = stream->second.output.pending();
           const FlushResult result =
               flushOutput(stream->second.socket.get(), stream->second.output);
           if (result != FlushResult::Ready) {
             queueClose(tunnelOutput, watched.streamId);
             removeLocalStream(localStreams, watched.streamId, tunnelId);
             continue;
+          }
+          const std::size_t flushed =
+              queuedBefore - stream->second.output.pending();
+          if (flushed > 0 &&
+              !queueWindowUpdate(tunnelOutput, watched.streamId, flushed)) {
+            std::cerr
+                << "Failed to return flow-control credit for local stream "
+                << watched.streamId << std::endl;
+            relaySucceeded = false;
+            sessionRunning = false;
+            break;
           }
           if (stream->second.closeAfterFlush && stream->second.output.empty()) {
             removeLocalStream(localStreams, watched.streamId, tunnelId);
@@ -526,8 +565,13 @@ int main(int argc, char *argv[]) {
             if (!tunnelCanAcceptData(tunnelOutput)) {
               break;
             }
+            const std::size_t allowed =
+                current->second.sendWindow.allowedRead(sizeof(buffer));
+            if (allowed == 0) {
+              break;
+            }
             const ssize_t received =
-                recv(current->second.socket.get(), buffer, sizeof(buffer), 0);
+                recv(current->second.socket.get(), buffer, allowed, 0);
             if (received > 0) {
               const nexus::protocol::Frame dataFrame{
                   nexus::protocol::MessageType::Data,
@@ -537,6 +581,14 @@ int main(int argc, char *argv[]) {
                               nexus::limits::kMaxTunnelQueueBytes)) {
                 std::cerr << "Failed to encode DATA for stream "
                           << watched.streamId << std::endl;
+                relaySucceeded = false;
+                sessionRunning = false;
+                streamFinished = true;
+              } else if (!current->second.sendWindow.consume(
+                             static_cast<std::size_t>(received))) {
+                std::cerr << "Local stream " << watched.streamId
+                          << " consumed more flow-control credit than available"
+                          << std::endl;
                 relaySucceeded = false;
                 sessionRunning = false;
                 streamFinished = true;

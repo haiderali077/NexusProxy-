@@ -40,7 +40,7 @@ std::uint32_t readUint32(const std::vector<std::uint8_t>& input,
 
 bool isKnownMessageType(std::uint8_t value) {
     return value >= static_cast<std::uint8_t>(MessageType::Register) &&
-           value <= static_cast<std::uint8_t>(MessageType::AuthenticateFailed);
+           value <= static_cast<std::uint8_t>(MessageType::WindowUpdate);
 }
 
 std::string_view validateFields(MessageType type, std::uint32_t streamId,
@@ -106,6 +106,15 @@ std::string_view validateFields(MessageType type, std::uint32_t streamId,
             }
             if (payloadLength != 0) {
                 return "authentication responses must have an empty payload";
+            }
+            return {};
+
+        case MessageType::WindowUpdate:
+            if (streamId == 0) {
+                return "WINDOW_UPDATE requires a nonzero stream ID";
+            }
+            if (payloadLength != 4) {
+                return "WINDOW_UPDATE payloads must contain 4 bytes";
             }
             return {};
     }

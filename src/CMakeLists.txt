@@ -32,6 +32,7 @@ target_link_libraries(nexus_security PRIVATE
 add_library(nexus_runtime STATIC
     runtime/authentication.cpp
     runtime/config.cpp
+    runtime/flow_control.cpp
     runtime/heartbeat.cpp
     runtime/logging.cpp
     runtime/relay.cpp

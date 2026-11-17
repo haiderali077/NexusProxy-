@@ -4,6 +4,7 @@
 // connection through it. Protocol stream IDs keep each conversation separate.
 
 #include "nexus/config.hpp"
+#include "nexus/flow_control.hpp"
 #include "nexus/authentication.hpp"
 #include "nexus/auth_rate_limiter.hpp"
 #include "nexus/heartbeat.hpp"
@@ -66,6 +67,8 @@ struct PublicStream {
   // CLOSE may arrive after DATA that is still queued. Delay close() until the
   // final bytes reach the public user.
   bool closeAfterFlush{};
+  nexus::flow::SendWindow sendWindow{
+      nexus::limits::kMaxStreamQueueBytes};
 };
 
 // Leave room for one DATA frame plus control frames such as CLOSE. When this is
@@ -123,6 +126,20 @@ bool queueClose(OutputQueue &tunnelOutput, std::uint32_t streamId) {
                     nexus::limits::kMaxTunnelQueueBytes);
 }
 
+bool queueWindowUpdate(OutputQueue &tunnelOutput, std::uint32_t streamId,
+                       std::size_t increment) {
+  if (increment == 0 ||
+      increment > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+  return queueFrame(
+      tunnelOutput,
+      {nexus::protocol::MessageType::WindowUpdate, streamId,
+       nexus::flow::encodeWindowIncrement(
+           static_cast<std::uint32_t>(increment))},
+      nexus::limits::kMaxTunnelQueueBytes);
+}
+
 void finishPublicStream(
     std::unordered_map<std::uint32_t, PublicStream> &streams,
     OutputQueue &tunnelOutput, std::uint32_t streamId, bool notifyClient,
@@ -168,13 +185,23 @@ bool handleTunnelFrames(
       continue;
     }
 
+    if (frame.type == nexus::protocol::MessageType::WindowUpdate) {
+      std::uint32_t increment = 0;
+      if (!nexus::flow::decodeWindowIncrement(frame.payload, increment) ||
+          !stream->second.sendWindow.replenish(increment)) {
+        std::cerr << "Invalid WINDOW_UPDATE for public stream "
+                  << frame.streamId << std::endl;
+        return false;
+      }
+      continue;
+    }
+
     if (frame.type == nexus::protocol::MessageType::Data) {
       if (!stream->second.output.append(
               frame.payload, nexus::limits::kMaxStreamQueueBytes)) {
         std::cerr << "Public stream " << frame.streamId
-                  << " exceeded its output limit" << std::endl;
-        queueClose(tunnelOutput, frame.streamId);
-        removePublicStream(streams, frame.streamId, tunnelId);
+                  << " exceeded the credit it was granted" << std::endl;
+        return false;
       }
       continue;
     }
@@ -333,9 +360,10 @@ int main(int argc, char *argv[]) {
     std::vector<WatchedStream> watchedStreams;
     watchedStreams.reserve(publicStreams.size());
     for (const auto &[streamId, stream] : publicStreams) {
-      short events =
-          !stream.closeAfterFlush && tunnelCanAcceptData(tunnelOutput) ? POLLIN
-                                                                       : 0;
+      const bool canRead = !stream.closeAfterFlush &&
+                           stream.sendWindow.available() > 0 &&
+                           tunnelCanAcceptData(tunnelOutput);
+      short events = canRead ? POLLIN : 0;
       if (!stream.output.empty()) {
         events |= POLLOUT;
       }
@@ -547,12 +575,22 @@ int main(int argc, char *argv[]) {
 
       const short events = pollFds[watched.pollIndex].revents;
       if (events & POLLOUT) {
+        const std::size_t queuedBefore = stream->second.output.pending();
         const FlushResult result =
             flushOutput(stream->second.socket.get(), stream->second.output);
         if (result != FlushResult::Ready) {
           finishPublicStream(publicStreams, tunnelOutput, watched.streamId,
                              static_cast<bool>(tunnelSocket), activeTunnelId);
           continue;
+        }
+        const std::size_t flushed =
+            queuedBefore - stream->second.output.pending();
+        if (flushed > 0 &&
+            !queueWindowUpdate(tunnelOutput, watched.streamId, flushed)) {
+          std::cerr << "Failed to return flow-control credit for public stream "
+                    << watched.streamId << std::endl;
+          disconnectTunnel();
+          break;
         }
         if (stream->second.closeAfterFlush && stream->second.output.empty()) {
           removePublicStream(publicStreams, watched.streamId, activeTunnelId);
@@ -572,8 +610,13 @@ int main(int argc, char *argv[]) {
           if (!tunnelCanAcceptData(tunnelOutput)) {
             break;
           }
+          const std::size_t allowed =
+              current->second.sendWindow.allowedRead(sizeof(buffer));
+          if (allowed == 0) {
+            break;
+          }
           const ssize_t received =
-              recv(current->second.socket.get(), buffer, sizeof(buffer), 0);
+              recv(current->second.socket.get(), buffer, allowed, 0);
           if (received > 0) {
             const nexus::protocol::Frame dataFrame{
                 nexus::protocol::MessageType::Data,
@@ -583,6 +626,13 @@ int main(int argc, char *argv[]) {
                             nexus::limits::kMaxTunnelQueueBytes)) {
               std::cerr << "Failed to encode DATA for stream "
                         << watched.streamId << std::endl;
+              running = false;
+              streamFinished = true;
+            } else if (!current->second.sendWindow.consume(
+                           static_cast<std::size_t>(received))) {
+              std::cerr << "Public stream " << watched.streamId
+                        << " consumed more flow-control credit than available"
+                        << std::endl;
               running = false;
               streamFinished = true;
             }

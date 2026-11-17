@@ -13,6 +13,7 @@ endfunction()
 nexus_add_unit_test(protocol_tests nexus_protocol)
 nexus_add_unit_test(socket_tests nexus_runtime)
 nexus_add_unit_test(relay_tests nexus_runtime)
+nexus_add_unit_test(flow_control_tests nexus_runtime)
 nexus_add_unit_test(retry_tests nexus_runtime)
 nexus_add_unit_test(heartbeat_tests nexus_runtime)
 nexus_add_unit_test(shutdown_tests nexus_runtime)
@@ -71,6 +72,8 @@ nexus_add_tls_integration_test(
     integration_tunnel_confidentiality tunnel_confidentiality_test.py 20)
 nexus_add_tls_integration_test(
     integration_single_request integration_test.py 20)
+nexus_add_tls_integration_test(
+    integration_large_transfer large_transfer_test.py 30)
 nexus_add_tls_integration_test(
     integration_concurrent_streams concurrent_test.py 30)
 nexus_add_tls_integration_test(

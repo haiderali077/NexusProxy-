@@ -58,6 +58,7 @@ The maximum complete frame size is 65,548 bytes.
 | 8 | `AUTH` | Client to edge | `0` | 32–256 opaque token bytes. |
 | 9 | `AUTH_OK` | Edge to client | `0` | Empty. |
 | 10 | `AUTH_FAILED` | Edge to client | `0` | Empty. |
+| 11 | `WINDOW_UPDATE` | Either direction | Nonzero | 4-byte positive credit increment. |
 
 Message type `0` is invalid. Unknown message types are protocol errors.
 
@@ -88,6 +89,22 @@ with a new connection to the configured local service.
 it for public request bytes, and the client uses it for local response bytes.
 Several `DATA` frames still represent one continuous TCP byte stream; frame
 boundaries are not application-message boundaries.
+
+### `WINDOW_UPDATE`
+
+Each direction of a newly opened stream starts with 256 KiB of send credit.
+Before reading source bytes and placing them in `DATA` frames, an endpoint
+subtracts their size from that stream's credit. A zero-credit stream temporarily
+stops requesting readable events from `poll()`; other streams remain active.
+
+After the receiver successfully writes bytes to the destination socket, it
+returns exactly that much credit in a `WINDOW_UPDATE`. The payload is one
+positive unsigned 32-bit integer in network byte order. Zero increments,
+increments that grow the window beyond 256 KiB, and DATA beyond granted credit
+are protocol errors.
+
+Credit is tracked independently in both directions. This bounds each userspace
+stream queue while allowing requests and responses to be larger than the queue.
 
 ### `CLOSE`
 
@@ -139,12 +156,15 @@ client                         edge
   |       public user connects   |
   |<----- OPEN(stream 1) --------|
   |<----- DATA(stream 1) --------|  public request
+  |------ WINDOW_UPDATE -------->|  request bytes reached local service
   |------ DATA(stream 1) ------->|  local response
+  |<----- WINDOW_UPDATE ---------|  response bytes reached public user
   |<---- or ---- CLOSE --------->|  either side may close
 ```
 
-The registration exchange happens once per tunnel. `OPEN`, `DATA`, and `CLOSE`
-may later be interleaved for many stream IDs on that same tunnel.
+The registration exchange happens once per tunnel. `OPEN`, `DATA`,
+`WINDOW_UPDATE`, and `CLOSE` may later be interleaved for many stream IDs on
+that same tunnel.
 
 ## Streaming decoder behavior
 
@@ -173,6 +193,8 @@ The receiver closes the tunnel when it sees:
 - the wrong stream ID or direction for a message;
 - a stream frame before registration;
 - a duplicate `OPEN`; or
+- an invalid or overflowing `WINDOW_UPDATE`;
+- `DATA` beyond the stream's available credit; or
 - `DATA` or `CLOSE` for an unknown stream.
 
 Closing on an invalid frame keeps version 1 simple and prevents both sides from
@@ -196,7 +218,7 @@ continuing with different interpretations of the byte stream.
   transport layer.
 - Registration rejection has no detailed error response.
 - Stream priority, compression, and half-close are not supported.
-- Queue limits and backpressure belong to the multiplexing phase.
+- Flow control uses fixed per-stream windows rather than dynamic window sizing.
 
 ---
 
@@ -607,8 +629,8 @@ Writing fields manually also avoids two unsafe assumptions:
 ## 11. Validation rules
 
 `isKnownMessageType()` checks that a raw byte lies between the first and last
-currently assigned type values. This works because version 1 assigns the ten
-types consecutive values from 1 through 10. If future values contain gaps, this
+currently assigned type values. This works because version 1 assigns the eleven
+types consecutive values from 1 through 11. If future values contain gaps, this
 helper should become an explicit `switch`.
 
 `validateFields()` returns an empty `std::string_view` when fields are valid and
@@ -633,6 +655,7 @@ The main structural rules are:
 - `DATA` has at least one byte;
 - `PING` and `PONG` have exactly eight bytes; and
 - `AUTH` contains 32–256 bytes while its responses are empty; and
+- `WINDOW_UPDATE` has a nonzero stream ID and exactly four payload bytes; and
 - no payload exceeds 65,536 bytes.
 
 `isValidTunnelName()` uses `std::all_of()`:
