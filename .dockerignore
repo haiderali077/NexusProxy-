@@ -1,0 +1,14 @@
+.git
+.gitignore
+build
+build-*
+cmake-build-*
+.cache
+.idea
+.vscode
+*.log
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
