@@ -1,6 +1,10 @@
 # Private learning and planning documents
 /docs/learning/
 
+# Public-VM runtime configuration and secrets
+/deploy/public-vm/.env
+/deploy/public-vm/secrets/
+
 # Local editor and operating-system files
 .vscode/
 .idea/
