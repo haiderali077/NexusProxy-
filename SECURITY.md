@@ -55,6 +55,22 @@ deployment platform are trusted.
 - Authentication frames and errors never intentionally log token or key data.
 - `.env`, private build output, and local learning files are ignored by Git.
 
+### Public VM deployment
+
+- The Compose deployment runs the edge as a non-root UID/GID, drops all Linux
+  capabilities, prevents privilege escalation, and makes the container
+  filesystem read-only.
+- The TLS key and bearer token are file-backed Compose secrets and stay in an
+  ignored directory on the VM. They are not copied into the image.
+- Preflight validation checks certificate expiry and host identity, confirms
+  that the certificate and private key match, enforces private token/key modes,
+  and validates the Compose configuration before startup.
+- Container logs are rotated so an unattended edge cannot consume the VM's
+  disk indefinitely.
+- Cloud and host firewall rules remain the operator's responsibility. Restrict
+  SSH and tunnel-port sources wherever practical; expose the public service
+  port only to its intended audience.
+
 ## Configuration
 
 The edge requires:
@@ -102,6 +118,8 @@ whose root is distributed securely to the client.
 
 - Public TCP traffic is not automatically encrypted. HTTP users need HTTPS
   termination at a reverse proxy/ingress or a future NexusProxy feature.
+- The public VM runbook therefore produces a working internet demo, not an
+  assurance that the forwarded application itself is production-safe.
 - Local-service traffic is not automatically encrypted; protect non-loopback
   local networks separately.
 - Authentication uses one shared bearer token, not per-client identities, mTLS,
@@ -130,6 +148,9 @@ whose root is distributed securely to the client.
   images.
 - Disable core dumps where appropriate and protect swap/process inspection.
 - Place the edge behind firewall and connection-rate controls.
+- Keep the VM operating system, Docker Engine, base images, and OpenSSL patched.
+- Back up no generated private key unless there is a defined encrypted backup
+  and recovery process; rotating a demo credential is usually safer.
 - Monitor generic TLS/auth failures without logging candidate credentials.
 - Rotate certificates and tokens by restarting both sides until hot reload is
   implemented.
