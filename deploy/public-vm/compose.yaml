@@ -1,0 +1,47 @@
+services:
+  edge:
+    image: ${NEXUS_EDGE_IMAGE:-nexusproxy-edge:local}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["7000", "8000"]
+    user: "${NEXUS_RUNTIME_UID:?set NEXUS_RUNTIME_UID}:${NEXUS_RUNTIME_GID:?set NEXUS_RUNTIME_GID}"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges=true
+    pids_limit: 128
+    stop_grace_period: 10s
+    ports:
+      - name: tunnel
+        target: 7000
+        published: ${NEXUS_TUNNEL_PORT:-7000}
+        protocol: tcp
+      - name: public
+        target: 8000
+        published: ${NEXUS_PUBLIC_PORT:-8000}
+        protocol: tcp
+    environment:
+      NEXUS_TLS_CERT_FILE: /run/secrets/edge_certificate
+      NEXUS_TLS_KEY_FILE: /run/secrets/edge_private_key
+      NEXUS_AUTH_TOKEN_FILE: /run/secrets/auth_token
+    secrets:
+      - edge_certificate
+      - edge_private_key
+      - auth_token
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+secrets:
+  edge_certificate:
+    file: ./secrets/edge-cert.pem
+  edge_private_key:
+    file: ./secrets/edge-key.pem
+  auth_token:
+    file: ./secrets/auth-token
