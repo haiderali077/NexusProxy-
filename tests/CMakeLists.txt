@@ -90,3 +90,13 @@ nexus_add_tls_integration_test(
     integration_logging_and_limits logging_and_limits_test.py 30)
 nexus_add_tls_integration_test(
     integration_protocol_and_limits protection_test.py 30)
+
+if(UNIX)
+    add_test(
+        NAME deployment_public_vm_tools
+        COMMAND bash
+                ${CMAKE_CURRENT_SOURCE_DIR}/deployment/public_vm_tools_test.sh
+                ${PROJECT_SOURCE_DIR}/deploy/public-vm
+    )
+    set_tests_properties(deployment_public_vm_tools PROPERTIES TIMEOUT 20)
+endif()
